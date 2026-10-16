@@ -143,7 +143,7 @@ pub fn login_redirect_uri() -> Option<String> {
 ///
 /// 参数表：
 /// ```text
-///   client_id              内置的公开客户端（endpoints::client_id()）
+///   client_id              内置的公开客户端（endpoints::CLIENT_ID）
 ///   redirect_uri           http://localhost:{网关端口}/oauth-callback
 ///   response_type          code
 ///   scope                  6 个 scope 空格连接（endpoints::SCOPES，顺序照参考）
@@ -159,7 +159,7 @@ pub fn build_authorize_url(state: &str) -> Option<String> {
     let redirect_uri = login_redirect_uri()?;
     let mut url = url::Url::parse(endpoints::AUTH_URL).ok()?;
     url.query_pairs_mut()
-        .append_pair("client_id", &endpoints::client_id())
+        .append_pair("client_id", endpoints::CLIENT_ID)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
         .append_pair("scope", &endpoints::SCOPES.join(" "))
@@ -329,10 +329,10 @@ pub async fn refresh_access_token(
         // `Accept: application/json` 与别家的管理接口一致；token 端点本就回 JSON
         .header("Accept", "application/json")
         .form(&[
-            ("client_id", endpoints::client_id()),
-            ("client_secret", endpoints::client_secret()),
-            ("refresh_token", refresh_token.to_string()),
-            ("grant_type", endpoints::GRANT_TYPE_REFRESH.to_string()),
+            ("client_id", endpoints::CLIENT_ID),
+            ("client_secret", endpoints::CLIENT_SECRET),
+            ("refresh_token", refresh_token),
+            ("grant_type", endpoints::GRANT_TYPE_REFRESH),
         ])
         .send()
         .await
@@ -506,11 +506,11 @@ pub async fn exchange_code(
         .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
         .header("Accept", "application/json")
         .form(&[
-            ("client_id", endpoints::client_id()),
-            ("client_secret", endpoints::client_secret()),
-            ("code", code.to_string()),
-            ("redirect_uri", redirect_uri.to_string()),
-            ("grant_type", endpoints::GRANT_TYPE_AUTHORIZATION_CODE.to_string()),
+            ("client_id", endpoints::CLIENT_ID),
+            ("client_secret", endpoints::CLIENT_SECRET),
+            ("code", code),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("grant_type", endpoints::GRANT_TYPE_AUTHORIZATION_CODE),
         ])
         .send()
         .await

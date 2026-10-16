@@ -6,9 +6,12 @@
 #
 # 做三件事：
 #   1. 下载 build 工作流的 Windows 安装包 artifact（windows-nsis）到 dist/；
-#   2. 用 tag 所指提交的提交信息（= 更新日志，见 agent.md 第 6 节）创建 / 更新
-#      GitHub Release 并挂 Windows 安装包；
+#   2. 用 tag 所指提交的提交信息（= 更新日志，见 agent.md 第 5 节）创建 / 更新
+#      GitHub Release 并挂全部附件；
 #   3. 打印验收提示。
+#
+# linux-server-* 两个 artifact 是后加的（容器内一键更新用）：老 tag 的 run 里
+# 没有它们，脚本只提醒、不中断（历史 tag 仍可重跑收尾）。
 #
 # 幂等可重跑：附件 `--clobber` 覆盖上传。
 
@@ -22,14 +25,9 @@ case "$TAG" in
   *) echo "错误: '$TAG' 不是 v* 形式的 tag" >&2; exit 1 ;;
 esac
 
-if command -v gh >/dev/null 2>&1; then
-  GH=gh
-elif command -v gh.exe >/dev/null 2>&1; then
-  GH=gh.exe
-else
-  echo "错误: 未安装 gh CLI" >&2
-  exit 1
-fi
+command -v gh   >/dev/null || { echo "错误: 未安装 gh CLI" >&2; exit 1; }
+# gh 的 JSON 输出用 node 解析（不引入 jq 依赖，两端都有 node）
+command -v node >/dev/null || { echo "错误: 未安装 node" >&2; exit 1; }
 
 # fork 仓库里 gh 默认可能识别 upstream；发版和上传 artifact 必须固定走 origin。
 ORIGIN_URL=$(git remote get-url origin)
@@ -38,15 +36,6 @@ case "$RELEASE_REPO" in
   */*) ;;
   *) echo "错误: 无法从 origin URL 解析 GitHub 仓库: $ORIGIN_URL" >&2; exit 1 ;;
 esac
-# gh 的 JSON 输出用 node 解析（不引入 jq 依赖，两端都有 node）
-if command -v node >/dev/null 2>&1; then
-  NODE=node
-elif command -v node.exe >/dev/null 2>&1; then
-  NODE=node.exe
-else
-  echo "错误: 未安装 node" >&2
-  exit 1
-fi
 
 # gh 是 Go 程序：既不读 git 的 http.proxy，也不读 Windows 系统代理，只认代理
 # 环境变量。本机 git 配了代理而 gh 没配，下面的下载安装包与上传附件都是大文件
@@ -60,19 +49,6 @@ if [ -z "${HTTPS_PROXY:-}" ]; then
   # 只取 --get-urlmatch 会漏掉 https.proxy，只取 https.proxy 会漏掉前两种。
   GH_PROXY=$(git config --get-urlmatch http.proxy https://github.com || true)
   [ -n "$GH_PROXY" ] || GH_PROXY=$(git config --get https.proxy || true)
-  # WSL 里调用 Windows gh.exe 时，再兜底读取 Windows 系统代理。
-  if [ -z "$GH_PROXY" ] && command -v reg.exe >/dev/null 2>&1; then
-    WIN_PROXY_ENABLED=$(reg.exe query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyEnable 2>/dev/null \
-      | tr -d '\r' | sed -n 's/.*ProxyEnable[[:space:]]*REG_DWORD[[:space:]]*0x1$/1/p')
-    if [ "$WIN_PROXY_ENABLED" = "1" ]; then
-      WIN_PROXY_SERVER=$(reg.exe query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyServer 2>/dev/null \
-        | tr -d '\r' | sed -n 's/.*ProxyServer[[:space:]]*REG_SZ[[:space:]]*//p')
-      case "$WIN_PROXY_SERVER" in
-        *://*) GH_PROXY="$WIN_PROXY_SERVER" ;;
-        *:*) GH_PROXY="http://$WIN_PROXY_SERVER" ;;
-      esac
-    fi
-  fi
   if [ -n "$GH_PROXY" ]; then
     export HTTPS_PROXY="$GH_PROXY"
     echo "→ 已启用代理: $GH_PROXY"
@@ -82,44 +58,44 @@ fi
 # ── 1. 定位 build run 并下载安装包 ────────────────────────────
 if [ -z "$RUN_ID" ]; then
   echo "→ 查找 $TAG 触发的 build 工作流…"
-  # 不按 run 整体 conclusion 过滤：只验「安装包 artifact 是否齐全」，
+  # 不按 run 整体 conclusion 过滤：只验「两个安装包 artifact 是否齐全」，
   # 构建成功但别处失败的 run 里安装包照旧可用
-  for id in $("$GH" run list --repo "$RELEASE_REPO" --workflow=build --limit 30 --json databaseId,headBranch \
-      | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{JSON.parse(s).filter(r=>r.headBranch===process.argv[1]).forEach(r=>process.stdout.write(r.databaseId+"\n"))})' "$TAG"); do
-    if "$GH" api "repos/$RELEASE_REPO/actions/runs/$id/artifacts" \
+  for id in $(gh run list --repo "$RELEASE_REPO" --workflow=build --limit 30 --json databaseId,headBranch \
+      | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{JSON.parse(s).filter(r=>r.headBranch===process.argv[1]).forEach(r=>process.stdout.write(r.databaseId+"\n"))})' "$TAG"); do
+    if gh api "repos/$RELEASE_REPO/actions/runs/$id/artifacts" \
          --jq 'any(.artifacts[].name; . == "windows-nsis")' >/dev/null 2>&1; then
       RUN_ID=$id
       break
     fi
   done
   [ -n "$RUN_ID" ] || {
-    echo "错误: 没找到 $TAG 的可用 build run（需 windows-nsis artifact）—— 先确认 CI 跑完（gh run list），或手动传 run-id" >&2
+  echo "错误: 没找到 $TAG 的可用 build run（需 windows-nsis artifact）—— 先确认 CI 跑完（gh run list），或手动传 run-id" >&2
     exit 1
   }
 fi
 echo "→ build run: $RUN_ID"
 
 rm -rf dist
-"$GH" run download "$RUN_ID" --repo "$RELEASE_REPO" -D dist
+gh run download "$RUN_ID" --repo "$RELEASE_REPO" -D dist
 EXE=$(ls dist/windows-nsis/*.exe)
 echo "→ 已下载 $(basename "$EXE")"
 
 # ── 2. 更新日志 = tag 所指提交的提交信息 ──────────────────────
-NOTES_FILE=".release-notes.$$.tmp"
+NOTES_FILE=$(mktemp)
 trap 'rm -f "$NOTES_FILE"' EXIT
 git log -1 --format=%B "$TAG" > "$NOTES_FILE"
 
 echo "→ GitHub Release"
-if "$GH" release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
-  "$GH" release upload "$TAG" --repo "$RELEASE_REPO" --clobber "$EXE"
+if gh release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
+  gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber "$EXE"
   echo "  ↳ 已存在，附件覆盖上传"
 else
-  "$GH" release create "$TAG" --repo "$RELEASE_REPO" --title "$TAG" --notes-file "$NOTES_FILE" "$EXE"
+  gh release create "$TAG" --repo "$RELEASE_REPO" --title "$TAG" --notes-file "$NOTES_FILE" "$EXE"
 fi
 
 # ── 3. 验收提示 ───────────────────────────────────────────────
 echo
 echo "发版收尾完成。核对："
-echo "  [1] GitHub Release:  $GH release view $TAG"
+echo "  [1] GitHub Release:  gh release view $TAG"
 echo "  [2] Windows 安装包:  $EXE"
 echo "  [3] 安装包「关于」页版本号与 $TAG 一致"

@@ -150,11 +150,28 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
 
 /// `/api/proxies*` 的入口（同样接受任意方法）。
 ///
-/// 七条已注册路径：`/api/proxies`、`/api/proxies/test`（Node 版原有的出口
-/// 能力）与 `/api/proxies/pool`、`/pool/update`、`/pool/remove`、`/pool/test`、
-/// `/pool/sync-clash`（「网络代理」页的代理池 CRUD + 测试 + Clash 同步，
-/// 见 `api::proxies` 的模块头）。池那几条的 id 走 body，不做路径段 ——
-/// 判定的写法因此还是一张 (方法, 剩余路径) 的表，与原来的两条完全同形。
+/// 已注册路径：`/api/proxies`、`/api/proxies/test`（Node 版原有的出口能力）与
+/// `/api/proxies/pool`、`/pool/update`、`/pool/enable`、`/pool/remove`、
+/// `/pool/test`、`/pool/sync-clash`（「网络代理」页的代理池 CRUD + 启停 + 测试
+/// + Clash 同步，见 `api::proxies` 的模块头）。池那几条的 id 走 body，不做
+/// 路径段 —— 判定的写法因此还是一张 (方法, 剩余路径) 的表，与原来的两条完全同形。
+/// 账号写操作收尾：引用集合若新增了「还没有监听器的订阅节点」，请求内核
+/// 补建（lazy listeners 的触发点，见 `api::proxies::provision_missing_listeners`）。
+///
+/// 对账用「改动前后引用 id 集合」的**差集**而不是无脑重启：改个备注名不该
+/// 付一次内核重启的等待（重启要重建全部监听器，几秒）；只有新增引用才投。
+/// 缩小集合（取消引用 / 删账号）不触发 —— 摘监听器等下次任何重启自然完成，
+/// 端口留着也无害（注册表不裁剪，见 `runtime::write_ports`）。
+fn sync_kernel_if_new_pool_refs(state: &ServerState, before: &std::collections::HashSet<String>) {
+    let after = state.store().referenced_pool_ids();
+    if after.is_subset(before) {
+        return; // 没有新增引用（纯改动 / 删除），不重启
+    }
+    // 只要有新增就走 provision：它内部再判断「缺口是否真实存在」（被引用的
+    // 节点可能早就有端口），不重复投命令
+    super::proxies::provision_missing_listeners(state);
+}
+
 pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extract::Request) -> Response {
     let method = request.method().clone();
     let full_path = request.uri().path().to_string();
@@ -175,9 +192,12 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
         ("GET", "pool") => super::proxies::pool_list(&state).await,
         ("POST", "pool") => super::proxies::pool_create(&state, &body).await,
         ("POST", "pool/update") => super::proxies::pool_update(&state, &body).await,
+        ("POST", "pool/enable") => super::proxies::pool_enable(&state, &body).await,
         ("POST", "pool/remove") => super::proxies::pool_remove(&state, &body).await,
         ("POST", "pool/test") => super::proxies::pool_test(&state, &body).await,
         ("POST", "pool/sync-clash") => super::proxies::pool_sync_clash(&state).await,
+        ("GET", "settings") => super::proxies::settings_get().await,
+        ("POST", "settings") => super::proxies::settings_save(&body).await,
         // 已注册路径上的其它方法：Node 的 tryHandleProxies 落到它自己的 404 信封
         _ => management_error(
             404,
@@ -404,6 +424,8 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
+    // 引用集合快照（成功落账号后对账，见 `sync_kernel_if_new_pool_refs`）
+    let refs_before = state.store().referenced_pool_ids();
     let provider = payload
         .get("provider")
         .and_then(Value::as_str)
@@ -815,10 +837,14 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         }
     };
     match result {
-        Ok(account) => ok_json(json!({
-            "account": account,
-            "list": store.list_accounts(),
-        })),
+        Ok(account) => {
+            // 落号成功后对账：新增了池引用就请求内核补监听器（lazy listeners）
+            sync_kernel_if_new_pool_refs(state, &refs_before);
+            ok_json(json!({
+                "account": account,
+                "list": store.list_accounts(),
+            }))
+        }
         Err(error) => store_error(error),
     }
 }
@@ -896,6 +922,8 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
+    // 引用集合快照（批量改代理成功后对账，见 `sync_kernel_if_new_pool_refs`）
+    let refs_before = state.store().referenced_pool_ids();
     // ids 去重 + 过滤空串，逐字照抄 Node 版
     let mut ids: Vec<String> = Vec::new();
     if let Some(items) = payload.get("ids").and_then(Value::as_array) {
@@ -953,6 +981,9 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
 
     match result {
         Ok(value) => {
+            // 批量改代理 / 删除成功后对账：新增了池引用就请求内核补监听器
+            // （lazy listeners）。删除只可能缩小集合，provision 内部会因无缺口不投。
+            sync_kernel_if_new_pool_refs(state, &refs_before);
             // 响应带上 action，与 Node 版 `{ action, ...result, list }` 一致
             let mut merged = Map::new();
             merged.insert("action".to_string(), Value::String(action));
@@ -1303,6 +1334,8 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
     if !patch.is_object() {
         return management_error(400, "请求内容必须是 JSON 对象");
     }
+    // 引用集合快照（改代理成功后对账，见 `sync_kernel_if_new_pool_refs`）
+    let refs_before = state.store().referenced_pool_ids();
     // CatPaw 的余额查询凭证（`balanceToken`）先落盘：它是**这一家独有**的字段，
     // 通用 `update_account` 不认识它（见 `update_catpaw_balance_token` 的说明：
     // 不把它塞进四家共用的 apply_patch）。放在通用 patch 之前做，于是同一次
@@ -1403,9 +1436,41 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             Err(error) => return store_error(error),
         }
     }
+    // 自定义账号的**余额查询配置**（`balanceQuery`）：与上面 apiKey 那一段同一
+    // 处境 —— 只有「登记了余额方案的自定义家」认这个键（判据在 core 层：不是
+    // 自定义家、或那一家没登记方案，一律 400，见 `update_custom_balance_query`）。
+    // 三个密字段（访问令牌 / 密码 / 控制台令牌）只在这一次请求里以明文出现，
+    // 落库即被整行加密信封包住（见 `account_store::sql` 的模块头）；响应侧
+    // 永远只有 `has*` 标记（见 `store_view::balance_query_public`）。
+    if let Some(value) = patch.get("balanceQuery") {
+        if state.store().custom_account_provider(&id).is_none() {
+            let known = state
+                .store()
+                .list_accounts()
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map(|accounts| {
+                    accounts
+                        .iter()
+                        .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .unwrap_or(false);
+            return if known {
+                management_error(400, "只有自定义提供商的账号有余额查询配置（balanceQuery）")
+            } else {
+                store_error(AccountStoreError::new("账号不存在", 404))
+            };
+        }
+        match state.store().update_custom_balance_query(&id, value) {
+            Ok(changes) => balance_changes.extend(changes),
+            Err(error) => return store_error(error),
+        }
+    }
     match state.store().update_account(&id, &patch) {
         Ok((account, mut changes)) => {
             changes.extend(balance_changes);
+            // 改代理成功后对账：新增了池引用就请求内核补监听器（lazy listeners）
+            sync_kernel_if_new_pool_refs(state, &refs_before);
             ok_json(json!({
                 "account": account,
                 "changes": changes,
@@ -1529,7 +1594,14 @@ pub fn delete_account(state: &ServerState, id: &str) -> Response {
         return management_error(400, "缺少账号 id");
     }
     match state.store().remove_account(id) {
-        Ok(()) => ok_json(json!({ "list": state.store().list_accounts() })),
+        Ok(()) => {
+            // 删除只缩小引用集合：不需要补监听器；这里照调一次对账入口，
+            // 依赖它「无新增引用就不投命令」的判据成为 no-op —— 链路统一，
+            // 将来若要「最后一个引用消失时摘监听器」只改这一处
+            let before = state.store().referenced_pool_ids();
+            sync_kernel_if_new_pool_refs(state, &before);
+            ok_json(json!({ "list": state.store().list_accounts() }))
+        }
         Err(error) => store_error(error),
     }
 }

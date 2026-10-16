@@ -54,27 +54,10 @@
 ///
 /// 它是**公开**客户端凭证（随官方客户端分发），不是用户机密 —— 但仍只出现在
 /// form 请求体里，不进日志（见 `oauth.rs` 的日志口径）。
-// Hex-encoded to avoid GitHub push protection on public desktop-app OAuth credentials.
-pub const CLIENT_ID_HEX: &str = "313037313030363036303539312D746D687373696E326832316C63726532333576746F6C6F6A68346734303365702E617070732E676F6F676C6575736572636F6E74656E742E636F6D";
+pub const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 
-pub fn client_id() -> String {
-    hex_decode(CLIENT_ID_HEX)
-}
-
-/// 与 [`client_id`] 配套的 client secret（同上，公开值）。
-pub const CLIENT_SECRET_HEX: &str = "474F435350582D4B35384657523438364C644C4A316D4C4238735843347A3671444166";
-
-pub fn client_secret() -> String {
-    hex_decode(CLIENT_SECRET_HEX)
-}
-
-fn hex_decode(hex: &str) -> String {
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-        .collect();
-    String::from_utf8(bytes).unwrap_or_default()
-}
+/// 与 [`CLIENT_ID`] 配套的 client secret（同上，公开值）。
+pub const CLIENT_SECRET: &str = "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";
 
 /// 授权码端点（网页登录的 authorization endpoint，见 `oauth::build_authorize_url`）
 pub const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -126,7 +109,7 @@ pub const METHOD_STREAM_GENERATE: &str = "streamGenerateContent";
 pub const METHOD_GENERATE: &str = "generateContent";
 /// 模型目录 + 每模型配额
 pub const METHOD_FETCH_AVAILABLE_MODELS: &str = "fetchAvailableModels";
-/// 分组额度（周 / 5 小时窗）—— 本步不用，登记给后续余额/配额展示
+/// 分组额度（周 / 5 小时窗）—— 余额窗口读数（`balance.rs`）
 pub const METHOD_RETRIEVE_QUOTA_SUMMARY: &str = "retrieveUserQuotaSummary";
 /// 订阅档 + `cloudaicompanionProject`
 pub const METHOD_LOAD_CODE_ASSIST: &str = "loadCodeAssist";
@@ -268,6 +251,13 @@ pub fn generate_url(base: &str) -> String {
 /// 模型目录端点（`{base}:fetchAvailableModels`）
 pub fn fetch_available_models_url(base: &str) -> String {
     method_url(base, METHOD_FETCH_AVAILABLE_MODELS)
+}
+
+/// 分组额度摘要端点（`{base}:retrieveUserQuotaSummary`）—— 余额窗口读数走它
+/// （Manager `modules/quota.rs::fetch_quota_summary` 的同一条；基址顺序与
+/// [`V1_BASE_URLS`] 相同：sandbox → daily → prod）
+pub fn retrieve_user_quota_summary_url(base: &str) -> String {
+    method_url(base, METHOD_RETRIEVE_QUOTA_SUMMARY)
 }
 
 /// project 发现：`loadCodeAssist`（**prod**，见 [`PROJECT_BASE_URL`]）

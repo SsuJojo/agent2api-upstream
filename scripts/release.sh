@@ -25,6 +25,19 @@ case "$TAG" in
   *) echo "错误: '$TAG' 不是 v* 形式的 tag" >&2; exit 1 ;;
 esac
 
+# ── beta 版：tag 带预发布后缀（v3.1.0-beta.1）时，Release 必须标 pre-release ──
+# 这个标记是应用里「加入 beta 版」开关的分界线：正式通道走 GitHub 的
+# /releases/latest，它**排除**被标记的预发布；只有打开开关的人才从 /releases
+# 列表里把 beta 捞出来。漏标 = beta 会被所有正式版用户当成正式更新收到；
+# 给正式版误标则谁都不更新。所以这里按 tag 自动判、并顺手修正已存在的 Release。
+case "${TAG#v}" in
+  *-*) PRERELEASE=true ;;
+  *)   PRERELEASE=false ;;
+esac
+if [ "$PRERELEASE" = true ]; then
+  echo "→ 检测到预发布后缀（${TAG#v}），Release 标记为 pre-release（只发给「加入 beta 版」的用户）"
+fi
+
 command -v gh   >/dev/null || { echo "错误: 未安装 gh CLI" >&2; exit 1; }
 # gh 的 JSON 输出用 node 解析（不引入 jq 依赖，两端都有 node）
 command -v node >/dev/null || { echo "错误: 未安装 node" >&2; exit 1; }
@@ -78,6 +91,7 @@ echo "→ build run: $RUN_ID"
 rm -rf dist
 gh run download "$RUN_ID" --repo "$RELEASE_REPO" -D dist
 EXE=$(ls dist/windows-nsis/*.exe)
+ASSETS=("$EXE")
 echo "→ 已下载 $(basename "$EXE")"
 
 # ── 2. 更新日志 = tag 所指提交的提交信息 ──────────────────────
@@ -87,15 +101,24 @@ git log -1 --format=%B "$TAG" > "$NOTES_FILE"
 
 echo "→ GitHub Release"
 if gh release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
-  gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber "$EXE"
-  echo "  ↳ 已存在，附件覆盖上传"
+  gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber "${ASSETS[@]}"
+  # 已存在时也把预发布标记纠正一遍（重跑收尾 / 当初漏标的情形都靠这一行自愈）
+  gh release edit "$TAG" --repo "$RELEASE_REPO" --prerelease="$PRERELEASE"
+  echo "  ↳ 已存在，附件覆盖上传（pre-release=$PRERELEASE）"
 else
-  gh release create "$TAG" --repo "$RELEASE_REPO" --title "$TAG" --notes-file "$NOTES_FILE" "$EXE"
+  gh release create "$TAG" --repo "$RELEASE_REPO" --prerelease="$PRERELEASE" --title "$TAG" \
+    --notes-file "$NOTES_FILE" "${ASSETS[@]}"
+  echo "  ↳ 已创建（pre-release=$PRERELEASE）"
 fi
 
 # ── 3. 验收提示 ───────────────────────────────────────────────
 echo
 echo "发版收尾完成。核对："
-echo "  [1] GitHub Release:  gh release view $TAG"
-echo "  [2] Windows 安装包:  $EXE"
+echo "  [1] GitHub Release:  gh release view $TAG --repo $RELEASE_REPO"
+if [ "$PRERELEASE" = true ]; then
+  echo "      ↑ beta 版：Release 应显示 Prerelease —— 正式版用户收不到它，"
+  echo "        只有开了「加入 beta 版」的用户收得到（见 agent.md 第 4 节）"
+else
+  echo "  [2] Windows 安装包:  $EXE"
+fi
 echo "  [3] 安装包「关于」页版本号与 $TAG 一致"

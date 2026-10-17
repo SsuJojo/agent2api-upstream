@@ -14,8 +14,12 @@
 
 use serde_json::Value;
 
-/// 默认更新仓库：fork 版发布到自己的 GitHub Release（Node 版 DEFAULT_REPO）
-pub const DEFAULT_REPO: &str = "weiang12345/agent2api";
+/// 默认更新仓库：本仓库发布到自己的 GitHub Release（Node 版 DEFAULT_REPO）
+///
+/// 2026-10-17 接手后从 `weiang12345/agent2api` 改指本仓库：更新检查读的是
+/// 这个常量的 Release 列表，留着上游 fork 的地址会让「检查更新」指向别人的
+/// 发布线。见根目录 TAKEOVER.md。
+pub const DEFAULT_REPO: &str = "haremank/agent2api";
 
 /// GitHub API 根（Node 版 GITHUB_API）—— [`api_base`] 的默认值
 pub const GITHUB_API: &str = "https://api.github.com";

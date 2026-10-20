@@ -27,7 +27,7 @@ use serde_json::{json, Map, Value};
 use super::{
     chat_frame, content_parts, content_text, is_truthy, json_number_of, json_text, native_tool,
     random_id, string_field, string_value, SseLineBuffer, FIELD_ENCRYPTED_CONTENT,
-    FIELD_REASONING_ITEM_ID,
+    FIELD_IS_ERROR, FIELD_REASONING_ITEM_ID,
 };
 use super::responses::{image_url_of, tool_output_parts, ConvertError, ToolOutput};
 use super::tool_plan;
@@ -81,10 +81,19 @@ pub fn responses_request_from_chat(chat: &Value, model: &str) -> Result<Value, C
             // tool 结果 → function_call_output 项（call_id 是配对的钥匙，
             // 缺了它上游在多轮里认不出这条结果属于哪次调用）
             "tool" => {
+                // is_error 在 Responses 的 function_call_output 上没有独立
+                // 字段（Chat/Anthropic 有）：折成输出文本前缀，让模型把失败
+                // 当失败推理，而不是当正常输出继续跑。与 anthropic 出站的
+                // is_error 恢复、参考实现的 "Error: " 前缀同一取向。
+                let is_error = message.get(FIELD_IS_ERROR).and_then(Value::as_bool) == Some(true);
+                let mut output = tool_output_to_responses(tool_output_parts(message.get("content")));
+                if is_error {
+                    output = mark_output_error(output);
+                }
                 items.push(json!({
                     "type": "function_call_output",
                     "call_id": string_field(message, "tool_call_id"),
-                    "output": tool_output_to_responses(tool_output_parts(message.get("content"))),
+                    "output": output,
                 }));
             }
             "assistant" => push_assistant_items(&mut items, message),
@@ -200,9 +209,12 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty());
     if !reasoning.is_empty() || encrypted.is_some() {
-        // id 只回填**上游真实给过的**那个（见 `_wb_reasoning_item_id`）。
-        // 没暂存到就不带：伪造一个 `rs_` 配真实的 `encrypted_content`，严格
-        // 上游按 item id 查项时会整轮拒绝 —— 这比不带 id 更糟。
+        // id 只在**带加密体、且确实拿到了上游真实 id**时给：
+        //   - 没有加密载体的回放（下游 Messages 链路把 thinking 文本折回
+        //     summary）本就不该带 id；
+        //   - 有载体但没暂存到 id 时，伪造一个 `rs_` 配上真实加密体，严格上游
+        //     （官方 Responses store:false）按 item id 查项会整轮拒绝 —— 比不带
+        //     id 更糟。input 项的 id 本就可省。
         let mut item = json!({
             "type": "reasoning",
             "summary": if reasoning.is_empty() {
@@ -302,6 +314,44 @@ fn tool_output_to_responses(output: ToolOutput) -> Value {
         return Value::String(output.text);
     }
     Value::Array(parts)
+}
+
+/// 给工具输出打上失败标记（`is_error` 的 Responses 表达）。
+///
+/// Responses 的 `function_call_output.output` 没有独立的 is_error 字段，
+/// 与参考实现同款折成文本前缀：字符串直接加 `Error: `；带图的数组形态
+/// 把前缀折进第一个 input_text，连文本块都没有时补一个，保证失败可见。
+fn mark_output_error(output: Value) -> Value {
+    match output {
+        Value::Array(mut parts) => {
+            let text_slot =
+                parts.iter().position(|part| string_field(part, "type") == "input_text");
+            match text_slot {
+                Some(index) => {
+                    let text = string_field(&parts[index], "text");
+                    if let Some(object) = parts[index].as_object_mut() {
+                        object.insert(
+                            "text".to_string(),
+                            Value::String(format!("Error: {text}")),
+                        );
+                    }
+                }
+                None => parts.insert(
+                    0,
+                    json!({ "type": "input_text", "text": "Error: (tool failed)" }),
+                ),
+            }
+            Value::Array(parts)
+        }
+        Value::String(text) => {
+            if text.is_empty() {
+                Value::String("Error: (tool failed)".to_string())
+            } else {
+                Value::String(format!("Error: {text}"))
+            }
+        }
+        other => other,
+    }
 }
 
 /// Chat content（字符串或块数组）→ Responses 的 input content。
@@ -468,11 +518,17 @@ pub struct ChatFromResponsesStream {
     created: i64,
     started: bool,
     finished: bool,
-    /// 已宣告的工具：item_id / call_id → 槽位（chat 的 tool_calls index +
+    /// 已宣告的工具：主键 → 槽位（chat 的 tool_calls index +
     /// 是否已发过参数增量）
     tools: BTreeMap<String, ToolSlot>,
     /// 已转发的 reasoning 连续性字段，按 upstream item id 去重。
     reasoning_items: BTreeMap<String, ReasoningSlot>,
+    /// 同一工具的**别名 → 主键**：官方 Responses 的 added 项同时带
+    /// `call_id`（`call_…`）与 `id`（`fc_…`）两个身份，而增量 / 收尾事件
+    /// 只带 `item_id`（值 = added 项的 `id`）。不归并别名的话，每个增量
+    /// 事件都会被当成没见过的新工具，经 `ensure_tool` 补出一组随机 id、
+    /// 空 name 的幽灵 tool_calls —— 下游因此看到翻倍的 tool_use。
+    tool_aliases: BTreeMap<String, String>,
     next_tool_index: i64,
     /// 上游最近的 usage（Responses 口径；收尾时折成 chat 形态）
     usage: Option<Value>,
@@ -503,6 +559,7 @@ impl ChatFromResponsesStream {
             finished: false,
             tools: BTreeMap::new(),
             reasoning_items: BTreeMap::new(),
+            tool_aliases: BTreeMap::new(),
             next_tool_index: 0,
             usage: None,
         }
@@ -606,8 +663,7 @@ impl ChatFromResponsesStream {
                     return Vec::new();
                 }
                 let mut out = self.start();
-                let key = tool_key(event, item);
-                out.extend(self.ensure_tool(&key, item));
+                self.ensure_tool(&mut out, event, item);
                 out
             }
             "response.function_call_arguments.delta" => {
@@ -616,8 +672,7 @@ impl ChatFromResponsesStream {
                     return Vec::new();
                 }
                 let mut out = self.start();
-                let key = tool_key(event, event);
-                out.extend(self.ensure_tool(&key, event));
+                let key = self.ensure_tool(&mut out, event, event);
                 out.extend(self.push_arguments(&key, &delta));
                 out
             }
@@ -634,15 +689,13 @@ impl ChatFromResponsesStream {
                     return Vec::new();
                 }
                 let mut out = self.start();
-                let key = tool_key(event, event);
-                out.extend(self.ensure_tool(&key, event));
+                let key = self.ensure_tool(&mut out, event, event);
                 out.extend(self.push_arguments(&key, &delta));
                 out
             }
             // 参数收尾：增量一个都没来过时（少数网关只发 .done）补完整参数
             "response.function_call_arguments.done" => {
-                let key = tool_key(event, event);
-                if self.has_arguments(&key) {
+                if self.tool_has_arguments(event, event) {
                     return Vec::new();
                 }
                 let arguments = {
@@ -650,19 +703,18 @@ impl ChatFromResponsesStream {
                     if raw.is_empty() { "{}".to_string() } else { raw }
                 };
                 let mut out = self.start();
-                out.extend(self.ensure_tool(&key, event));
+                let key = self.ensure_tool(&mut out, event, event);
                 out.extend(self.push_arguments(&key, &arguments));
                 out
             }
             "response.custom_tool_call_input.done" => {
-                let key = tool_key(event, event);
-                if self.has_arguments(&key) {
+                if self.tool_has_arguments(event, event) {
                     return Vec::new();
                 }
                 let input = json_text(event.get("input").unwrap_or(&Value::Null));
                 let arguments = super::freeform::wrap_freeform_input(&input);
                 let mut out = self.start();
-                out.extend(self.ensure_tool(&key, event));
+                let key = self.ensure_tool(&mut out, event, event);
                 out.extend(self.push_arguments(&key, &arguments));
                 out
             }
@@ -683,12 +735,11 @@ impl ChatFromResponsesStream {
                     }
                     _ => return Vec::new(),
                 };
-                let key = tool_key(event, item);
-                if self.has_arguments(&key) {
+                if self.tool_has_arguments(event, item) {
                     return Vec::new();
                 }
                 let mut out = self.start();
-                out.extend(self.ensure_tool(&key, item));
+                let key = self.ensure_tool(&mut out, event, item);
                 out.extend(self.push_arguments(&key, &arguments));
                 out
             }
@@ -709,12 +760,21 @@ impl ChatFromResponsesStream {
                 out
             }
             "response.incomplete" => {
+                // incomplete_details.reason 是 Responses 口径（官方值
+                // "max_output_tokens" / "content_filter"），而 chat 的
+                // finish_reason 只认 "length" / "content_filter" 等 —— 原样
+                // 透传会在下游出口被折成 end_turn，把「输出被截断」谎报成
+                // 「正常结束」。这里统一折算：截断 → length，拒答 → content_filter。
                 let reason = event
                     .pointer("/response/incomplete_details/reason")
                     .map(string_value)
                     .unwrap_or_default();
-                let reason = if reason.is_empty() { "length".to_string() } else { reason };
-                self.complete(Some(&reason))
+                let finish = if reason == "content_filter" {
+                    "content_filter"
+                } else {
+                    "length"
+                };
+                self.complete(Some(finish))
             }
             _ => Vec::new(),
         }
@@ -781,14 +841,37 @@ impl ChatFromResponsesStream {
         vec![self.delta_frame(json!({ "role": "assistant", "content": "" }))]
     }
 
-    /// 宣告一个工具（若未宣告过）：chat 的 tool_calls 首帧带 id / name / 空参数
-    fn ensure_tool(&mut self, key: &str, item: &Value) -> Vec<bytes::Bytes> {
-        if self.tools.contains_key(key) {
-            return Vec::new();
+    /// 解析或宣告一个工具，返回它的**主键**（chat 槽位键）。
+    ///
+    /// 已宣告过（含别名命中）：只把本次事件上新出现的身份补登记为别名，
+    /// 不发帧 —— added / delta / done 三类事件的身份形态不一（官方 added
+    /// 带 `call_id`+`id`，delta/done 只带 `item_id`），靠别名归并落同一个槽。
+    /// 未宣告过：以第一个可用身份为主键建槽、其余身份记为别名，并补发
+    /// chat 的 tool_calls 首帧（id / name / 空参数）进 `out`。
+    /// 无任何可用身份的事件返回空串（调用侧的 push_arguments 会静默跳过）。
+    fn ensure_tool(&mut self, out: &mut Vec<bytes::Bytes>, event: &Value, item: &Value) -> String {
+        if let Some(primary) = self.resolve_tool_key(event, item) {
+            for key in tool_identity_keys(event, item) {
+                if key != primary && !self.tools.contains_key(&key) {
+                    // 已登记到别的主键的别名不覆盖：宁可这个事件落到旧槽，也不能
+                    // 把两条工具的身份链悄悄接在一起。
+                    self.tool_aliases.entry(key).or_insert_with(|| primary.clone());
+                }
+            }
+            return primary;
         }
+        let keys = tool_identity_keys(event, item);
+        let Some(primary) = keys.first().cloned() else {
+            return String::new();
+        };
         let index = self.next_tool_index;
         self.next_tool_index += 1;
-        self.tools.insert(key.to_string(), ToolSlot { index, has_arguments: false });
+        self.tools.insert(primary.clone(), ToolSlot { index, has_arguments: false });
+        for key in keys.iter().skip(1) {
+            self.tool_aliases
+                .entry(key.clone())
+                .or_insert_with(|| primary.clone());
+        }
         let call_id = {
             let raw = string_field(item, "call_id");
             if raw.is_empty() {
@@ -799,14 +882,35 @@ impl ChatFromResponsesStream {
             }
         };
         let name = string_field(item, "name");
-        vec![self.delta_frame(json!({
+        out.push(self.delta_frame(json!({
             "tool_calls": [{
                 "index": index,
                 "id": call_id,
                 "type": "function",
                 "function": { "name": name, "arguments": "" },
             }],
-        }))]
+        })));
+        primary
+    }
+
+    /// 把一个事件 / 项上的身份解析到已登记槽位的主键（含别名回查）
+    fn resolve_tool_key(&self, event: &Value, item: &Value) -> Option<String> {
+        for key in tool_identity_keys(event, item) {
+            if self.tools.contains_key(&key) {
+                return Some(key);
+            }
+            if let Some(primary) = self.tool_aliases.get(&key) {
+                return Some(primary.clone());
+            }
+        }
+        None
+    }
+
+    /// 该工具（按全部身份键解析）是否已有参数增量落地
+    fn tool_has_arguments(&self, event: &Value, item: &Value) -> bool {
+        self.resolve_tool_key(event, item)
+            .map(|key| self.has_arguments(&key))
+            .unwrap_or(false)
     }
 
     /// 追加一段工具参数（槽位不存在时静默跳过 —— 没宣告过就没有 index 可挂）
@@ -915,21 +1019,36 @@ impl ChatFromResponsesStream {
     }
 }
 
-/// 事件 / 项里的工具身份键：call_id 优先，退到 id / item_id / output_index。
+/// 一个事件 / 项上可用的工具身份，按优先序（call_id / id / item_id /
+/// output_index）收齐并去重。
 ///
-/// 同一次调用的各个事件（added / delta / done）必须映射到同一个键，
-/// 上游保证这几个字段在各事件里一致（官方与参考实现都按这个优先链取值）。
-fn tool_key(event: &Value, item: &Value) -> String {
+/// 同一次调用的 added / delta / done 事件身份形态**不一**：官方 Responses 的
+/// added 项同时带 `call_id`（`call_…`）与 `id`（`fc_…`），而增量 / 收尾事件
+/// 只带 `item_id`（值 = added 项的 `id`）。槽位解析必须对着这份**全集**做
+/// 别名归并（见 `ChatFromResponsesStream::tool_aliases`），不能指望单一字段
+/// 在所有事件里都一致 —— 否则官方形态上游的每次增量都会新建幽灵槽。
+fn tool_identity_keys(event: &Value, item: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
     for text in [
         string_field(item, "call_id"),
         string_field(item, "id"),
         string_field(event, "item_id"),
     ] {
-        if !text.is_empty() {
-            return text;
+        if !text.is_empty() && !keys.contains(&text) {
+            keys.push(text);
         }
     }
-    event.get("output_index").map(string_value).unwrap_or_default()
+    // `output_index` 是**位置**不是身份：只在事件一个强身份都没带时才兜底，且用
+    // `idx:` 前缀与真 id 分属不同命名空间。把它无条件并进同一组键会让「同一
+    // output_index 上的另一个工具」被并进已有槽位（兼容网关常见：每次宣告都
+    // 从 0 开始编号，但 call_id / id 是新的）。
+    if keys.is_empty() {
+        let output_index = event.get("output_index").map(string_value).unwrap_or_default();
+        if !output_index.is_empty() {
+            keys.push(format!("idx:{output_index}"));
+        }
+    }
+    keys
 }
 
 /// Responses 的 usage → chat 的 usage（字段名与明细结构按 chat 口径折）。
@@ -970,4 +1089,227 @@ fn chat_usage_from_responses(usage: &Value) -> Value {
         Value::from(json_number_of(usage, &["total_tokens"]).max(input + output)),
     );
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 喂给状态机一个上游 Responses SSE 事件
+    fn feed(stream: &mut ChatFromResponsesStream, event: &Value) -> Vec<bytes::Bytes> {
+        let line = format!("data: {}\n\n", serde_json::to_string(event).unwrap());
+        stream.push(line.as_bytes())
+    }
+
+    fn text_of(frames: &[bytes::Bytes]) -> String {
+        frames.iter().map(|frame| String::from_utf8_lossy(frame).to_string()).collect()
+    }
+
+    /// 收集全部 tool_calls **首宣告**帧的 id（delta.tool_calls 里非空 id 的项）
+    fn announced_tool_ids(frames: &[bytes::Bytes]) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for frame in frames {
+            let text = String::from_utf8_lossy(frame);
+            let Some(data) = text.strip_prefix("data: ") else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(data.trim()) else { continue };
+            for call in value
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let id = string_field(call, "id");
+                if !id.is_empty() {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// 收集全部参数增量所挂的 tool_calls index
+    fn argument_delta_indexes(frames: &[bytes::Bytes]) -> Vec<i64> {
+        let mut indexes: Vec<i64> = Vec::new();
+        for frame in frames {
+            let text = String::from_utf8_lossy(frame);
+            let Some(data) = text.strip_prefix("data: ") else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(data.trim()) else { continue };
+            for call in value
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let arguments =
+                    call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
+                if !arguments.is_empty() {
+                    indexes.push(call.get("index").and_then(Value::as_i64).unwrap_or(-1));
+                }
+            }
+        }
+        indexes
+    }
+
+    /// 回归：官方 Responses 形态下 added 带 call_id+id 双身份、增量只带
+    /// item_id —— 三类事件必须落到同一个槽，不许出现随机 id 的幽灵槽。
+    #[test]
+    fn official_shape_deltas_reuse_the_added_tool_slot() {
+        let mut stream = ChatFromResponsesStream::new("gpt-5.2");
+        let mut all: Vec<bytes::Bytes> = Vec::new();
+        all.extend(feed(&mut stream, &json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": { "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                      "name": "get_weather", "arguments": "" },
+        })));
+        all.extend(feed(&mut stream, &json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "output_index": 0,
+            "delta": "{\"city\":",
+        })));
+        all.extend(feed(&mut stream, &json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "output_index": 0,
+            "delta": "\"Paris\"}",
+        })));
+        assert_eq!(announced_tool_ids(&all), vec!["call_1".to_string()]);
+        assert_eq!(argument_delta_indexes(&all), vec![0, 0]);
+        all.extend(feed(&mut stream, &json!({
+            "type": "response.completed",
+            "response": { "id": "resp_1", "usage": { "input_tokens": 10, "output_tokens": 5 } },
+        })));
+        let text = text_of(&all);
+        assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+    }
+
+    /// 少数网关只发 .done 不发增量：全量参数要经别名解析补进 added 的原槽
+    #[test]
+    fn done_backfills_arguments_into_the_same_slot() {
+        let mut stream = ChatFromResponsesStream::new("gpt-5.2");
+        let mut all: Vec<bytes::Bytes> = Vec::new();
+        all.extend(feed(&mut stream, &json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": { "type": "function_call", "id": "fc_9", "call_id": "call_9",
+                      "name": "run", "arguments": "" },
+        })));
+        all.extend(feed(&mut stream, &json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_9",
+            "arguments": "{\"ok\":true}",
+        })));
+        assert_eq!(announced_tool_ids(&all), vec!["call_9".to_string()]);
+        assert_eq!(argument_delta_indexes(&all), vec![0]);
+    }
+
+    /// response.incomplete 的官方 reason "max_output_tokens" 不是合法 chat
+    /// finish_reason —— 原样透传会在下游出口被折成 end_turn，把截断谎报成
+    /// 正常结束。必须折成 "length"。
+    #[test]
+    fn incomplete_max_output_tokens_maps_to_length() {
+        let mut stream = ChatFromResponsesStream::new("gpt-5.2");
+        feed(&mut stream, &json!({
+            "type": "response.created",
+            "response": { "id": "resp_2" },
+        }));
+        let all = feed(&mut stream, &json!({
+            "type": "response.incomplete",
+            "response": { "id": "resp_2", "incomplete_details": { "reason": "max_output_tokens" } },
+        }));
+        let text = text_of(&all);
+        assert!(text.contains("\"finish_reason\":\"length\""), "{text}");
+        assert!(text.contains("data: [DONE]"), "{text}");
+    }
+
+    #[test]
+    fn incomplete_content_filter_maps_to_content_filter() {
+        let mut stream = ChatFromResponsesStream::new("gpt-5.2");
+        feed(&mut stream, &json!({
+            "type": "response.created",
+            "response": { "id": "resp_3" },
+        }));
+        let all = feed(&mut stream, &json!({
+            "type": "response.incomplete",
+            "response": { "id": "resp_3", "incomplete_details": { "reason": "content_filter" } },
+        }));
+        assert!(text_of(&all).contains("\"finish_reason\":\"content_filter\""));
+    }
+
+    /// tool_result.is_error 在 Responses 上没有独立字段：折成 "Error: " 前缀，
+    /// 让模型把失败当失败推理（此前被静默丢弃）。
+    #[test]
+    fn tool_error_output_is_marked_for_responses_upstream() {
+        let chat = json!({
+            "model": "gpt-5.2",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": null, "tool_calls": [
+                    { "id": "call_1", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                ] },
+                { "role": "tool", "tool_call_id": "call_1", "content": "boom",
+                  "_wb_is_error": true },
+            ],
+        });
+        let body = responses_request_from_chat(&chat, "gpt-5.2").unwrap();
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["output"], "Error: boom");
+    }
+
+    /// 带图的失败结果：前缀折进数组里的第一个 input_text，图片块保留
+    #[test]
+    fn tool_error_marks_the_text_part_inside_array_output() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "tool", "tool_call_id": "call_2", "_wb_is_error": true,
+                  "content": [
+                      { "type": "text", "text": "boom" },
+                      { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                  ] },
+            ],
+        });
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let output = body["input"][0]["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[0]["text"], "Error: boom");
+        assert_eq!(output[1]["type"], "input_image");
+    }
+
+    /// 回放的 reasoning 项在**没有加密载体**时不得伪造 rs_ id —— 严格校验
+    /// item id 的上游（官方 Responses store:false）会按「查无此项」拒绝整轮。
+    #[test]
+    fn replayed_reasoning_without_encrypted_carries_no_fabricated_id() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": "answer", "reasoning_content": "thought" },
+            ],
+        });
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let item = &body["input"][0];
+        assert_eq!(item["type"], "reasoning");
+        assert!(item.get("id").is_none(), "无加密载体时不应伪造 rs_ id: {item}");
+        assert_eq!(item["summary"][0]["text"], "thought");
+    }
+
+    /// 带加密载体（Responses 下游链路）时保留 id + encrypted_content 的
+    /// 官方回传形态不变。
+    #[test]
+    fn reasoning_with_encrypted_content_keeps_an_id() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": "answer",
+                  "reasoning_content": "thought", "_wb_encrypted_content": "enc" },
+            ],
+        });
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let item = &body["input"][0];
+        assert_eq!(item["type"], "reasoning");
+        assert!(item.get("id").is_some(), "带加密体时应保留 id 形态: {item}");
+        assert_eq!(item["encrypted_content"], "enc");
+    }
 }

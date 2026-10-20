@@ -631,12 +631,18 @@ pub fn anthropic_from_chat(chat: &Value, model: &str) -> Value {
     }
     let stop_reason = if finish == "length" {
         "max_tokens"
+    } else if finish == "content_filter" {
+        // Anthropic 的对应档位：内容拦截是「拒绝」，不是「正常结束」
+        //
+        // 必须排在 `has_tool` 之前：响应里可能同时带了工具调用与被拦截的收尾，
+        // 流式出口（`finish()`）与聚合器都判成 `refusal`，非流式也要同口径。
+        "refusal"
     } else if finish == "tool_calls" || has_tool {
         "tool_use"
     } else if finish == "stop" || finish.is_empty() {
         "end_turn"
     } else {
-        // 其它 finish_reason（content_filter 等）：Anthropic 没有对应值，
+        // 其它 finish_reason（残余的未知值）：Anthropic 没有对应值，
         // 归到 end_turn（比编一个不存在的值好）
         "end_turn"
     };
@@ -789,23 +795,24 @@ impl AnthropicStream {
             .stop_reason
             .clone()
             .unwrap_or_else(|| if self.has_tool { "tool_use".to_string() } else { "end_turn".to_string() });
+        // message_delta 的 usage 是**累计值**：官方在这里也带 input_tokens 与
+        // 缓存命中。message_start 发出时（首帧内容到达，惰性开流）上游 usage
+        // 往往还没到，输入侧数字只能在这里补全 —— 否则流式客户端全程看不到
+        // input_tokens / cache_read。折算复用非流式的 usage_to_anthropic
+        // （input_tokens = 总输入 − 缓存命中，与 Anthropic 口径一致）。
+        let usage = match self.usage.as_ref() {
+            Some(usage) => usage_to_anthropic(Some(usage)),
+            None => json!({ "output_tokens": 0 }),
+        };
         out.push(self.event(
             "message_delta",
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                "usage": { "output_tokens": self.output_tokens() },
+                "usage": usage,
             }),
         ));
         out.push(self.event("message_stop", json!({})));
         out
-    }
-
-    fn output_tokens(&self) -> i64 {
-        self.usage
-            .as_ref()
-            .and_then(|usage| usage.get("completion_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
     }
 
     fn consume(&mut self, chunk: &Value) -> Vec<bytes::Bytes> {
@@ -847,6 +854,9 @@ impl AnthropicStream {
                 "max_tokens".to_string()
             } else if finish == "tool_calls" {
                 "tool_use".to_string()
+            } else if finish == "content_filter" {
+                // Anthropic 的对应档位：内容拦截是「拒绝」，不是「正常结束」
+                "refusal".to_string()
             } else {
                 "end_turn".to_string()
             });
@@ -1159,6 +1169,8 @@ impl AnthropicCollector {
         let stop_reason = match self.finish_reason.as_deref() {
             Some("length") => "max_tokens",
             Some("tool_calls") => "tool_use",
+            // 内容拦截映射成 Anthropic 的「拒绝」，不再谎报正常结束
+            Some("content_filter") => "refusal",
             _ if has_tool => "tool_use",
             _ => "end_turn",
         };
@@ -1205,5 +1217,136 @@ pub fn responses_error_code(status: u16) -> &'static str {
         429 => "rate_limit_error",
         500..=599 => "server_error",
         _ => "api_error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 喂给状态机一个标准 chat SSE 帧
+    fn feed(stream: &mut AnthropicStream, value: &Value) -> Vec<bytes::Bytes> {
+        let line = format!("data: {}\n\n", serde_json::to_string(value).unwrap());
+        stream.push(line.as_bytes())
+    }
+
+    fn text_of(frames: &[bytes::Bytes]) -> String {
+        frames.iter().map(|frame| String::from_utf8_lossy(frame).to_string()).collect()
+    }
+
+    /// 流式收尾的 message_delta 必须带全量 usage：input_tokens 是扣除缓存
+    /// 命中后的未缓存部分（与 Anthropic 口径一致），cache_read 单列 ——
+    /// 此前这里只有 output_tokens，流式客户端全程看不到输入侧 token 数。
+    #[test]
+    fn message_delta_reports_full_usage() {
+        let mut stream = AnthropicStream::new("glm-5.3");
+        let mut all: Vec<bytes::Bytes> = Vec::new();
+        all.extend(feed(&mut stream, &json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }],
+        })));
+        all.extend(feed(&mut stream, &json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "index": 0, "delta": { "content": "hi" }, "finish_reason": null }],
+        })));
+        all.extend(feed(&mut stream, &json!({
+            "id": "chatcmpl-1",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 7,
+                "prompt_tokens_details": { "cached_tokens": 40 },
+            },
+        })));
+        all.extend(stream.push(b"data: [DONE]\n\n"));
+        let out = text_of(&all);
+        assert!(out.contains("event: message_start"));
+        let delta = out
+            .split("event: message_delta")
+            .nth(1)
+            .unwrap_or("");
+        assert!(delta.contains("\"input_tokens\":60"), "input_tokens 应为未缓存部分 60: {delta}");
+        assert!(delta.contains("\"cache_read_input_tokens\":40"), "cache_read 应单列: {delta}");
+        assert!(delta.contains("\"output_tokens\":7"), "output_tokens 应保留: {delta}");
+    }
+
+    /// 没拿到 usage 时收尾帧也必须成形（output_tokens 0），不能缺 usage 对象
+    #[test]
+    fn message_delta_without_usage_still_shapes_the_frame() {
+        let mut stream = AnthropicStream::new("glm-5.3");
+        feed(&mut stream, &json!({
+            "id": "chatcmpl-2",
+            "choices": [{ "index": 0, "delta": { "content": "x" }, "finish_reason": null }],
+        }));
+        let out = text_of(&stream.push(b"data: [DONE]\n\n"));
+        let delta = out.split("event: message_delta").nth(1).unwrap_or("");
+        assert!(delta.contains("\"output_tokens\":0"), "缺 usage 时 output_tokens 应为 0: {delta}");
+    }
+
+    /// chat 的 content_filter 在 Anthropic 出口是 refusal（拒绝），不能落进
+    /// end_turn 谎报正常结束 —— 流式与非流式同口径。
+    #[test]
+    fn content_filter_maps_to_refusal_in_stream() {
+        let mut stream = AnthropicStream::new("glm-5.3");
+        feed(&mut stream, &json!({
+            "id": "chatcmpl-3",
+            "choices": [{ "index": 0, "delta": { "content": "x" }, "finish_reason": "content_filter" }],
+        }));
+        let out = text_of(&stream.push(b"data: [DONE]\n\n"));
+        let delta = out.split("event: message_delta").nth(1).unwrap_or("");
+        assert!(delta.contains("\"stop_reason\":\"refusal\""), "{delta}");
+    }
+
+    #[test]
+    fn content_filter_maps_to_refusal_off_stream() {
+        let chat = json!({
+            "id": "chatcmpl-4",
+            "choices": [{ "message": { "content": "x" }, "finish_reason": "content_filter" }],
+        });
+        let out = anthropic_from_chat(&chat, "glm-5.3");
+        assert_eq!(out["stop_reason"], "refusal");
+        assert_eq!(out["content"][0]["type"], "text");
+    }
+
+    /// 非流式聚合器的既有口径回归：length → max_tokens、工具 → tool_use
+    #[test]
+    fn non_stream_stop_reason_basics() {
+        let base = |finish: &str| {
+            json!({
+                "id": "c",
+                "choices": [{ "message": { "content": "x" }, "finish_reason": finish }],
+            })
+        };
+        assert_eq!(anthropic_from_chat(&base("length"), "m")["stop_reason"], "max_tokens");
+        assert_eq!(anthropic_from_chat(&base("stop"), "m")["stop_reason"], "end_turn");
+        let with_tool = json!({
+            "id": "c",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "f", "arguments": "{}" } }],
+                },
+                "finish_reason": "stop",
+            }],
+        });
+        assert_eq!(anthropic_from_chat(&with_tool, "m")["stop_reason"], "tool_use");
+    }
+
+    /// 工具调用 + `content_filter` 同时出现时被拦截优先（与流式出口同口径）：
+    /// 内容被拦掉了，随行的半截工具调用不该被下游当成一次成功的 `tool_use`。
+    #[test]
+    fn content_filter_wins_over_tool_calls_off_stream() {
+        let chat = json!({
+            "id": "c",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "f", "arguments": "{}" } }],
+                },
+                "finish_reason": "content_filter",
+            }],
+        });
+        assert_eq!(anthropic_from_chat(&chat, "m")["stop_reason"], "refusal");
     }
 }

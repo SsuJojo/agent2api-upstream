@@ -467,7 +467,25 @@ pub(super) fn mark_account_limited(
 /// `model` 是上游真名（见 `mark_account_limited` 的说明），与写入侧同一个键。
 pub(super) fn account_limit_reset_at(service: &UpstreamService, account_id: &str, model: &str) -> i64 {
     let snapshot = service.store.list_accounts();
-    let accounts = routing::accounts_of(&snapshot);
+    account_limit_reset_at_in(&routing::accounts_of(&snapshot), account_id, model)
+}
+
+/// 账号清单的一次性快照，供热路径上的**逐位**冷却判定共用。
+///
+/// `accounts_of` 会克隆整份清单；家内候选链若对每个候选各调一次
+/// [`account_limit_reset_at`]，就是「链长 × 账号数」次深拷贝，全部落在请求
+/// 路径上。调用方在账号循环里取一份、之后只做线性查找。
+pub(super) fn limit_snapshot(service: &UpstreamService) -> Vec<Value> {
+    routing::accounts_of(&service.store.list_accounts())
+}
+
+/// 与 [`account_limit_reset_at`] 同语义，账号清单由调用方预先取好
+/// （见 [`limit_snapshot`]）。
+pub(super) fn account_limit_reset_at_in(
+    accounts: &[Value],
+    account_id: &str,
+    model: &str,
+) -> i64 {
     accounts
         .iter()
         .find(|account| routing::account_id(account) == Some(account_id))

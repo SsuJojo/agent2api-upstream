@@ -329,6 +329,9 @@ pub const FIELD_CACHE_CONTROL: &str = "_wb_cache_control";
 pub const FIELD_IS_ERROR: &str = "_wb_is_error";
 /// reasoning encrypted_content 的暂存字段（assistant 消息上，值 = 原样的加密串）
 pub const FIELD_ENCRYPTED_CONTENT: &str = "_wb_encrypted_content";
+/// reasoning item id 的暂存字段（与 encrypted_content 同一消息，保持 store=false
+/// 连续性载荷的身份对应关系）
+pub const FIELD_REASONING_ITEM_ID: &str = "_wb_reasoning_item_id";
 
 /// 内部暂存字段的前缀：剥离按**前缀**而不是逐个常量 —— 将来加新字段时
 /// 剥离层自动覆盖，不会因为忘了同步清单而把内部字段漏给上游。

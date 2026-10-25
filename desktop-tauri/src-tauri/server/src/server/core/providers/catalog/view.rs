@@ -9,34 +9,11 @@ use crate::server::core::capability;
 use crate::server::core::key_scope::{self, KeyScope};
 use crate::server::core::model_meta;
 use crate::server::core::model_rules;
-use crate::server::core::models::{list_item, list_response_from, model_id, suggest_from};
+use crate::server::core::models::{list_response_from, model_id, suggest_from};
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 
-use super::routing::{builtin_target, entry_id_in_manifest};
+use super::routing::{entry_id_in_manifest, public_items_for_provider};
 use super::{active_manifests, aggregate_source, manifest_for, refresh_meta};
-
-/// 一家会对外广告哪些名字：清单里原生的上游 id + **已启用**的映射别名。
-///
-/// ── `enabled` 这一道过滤不能少（曾经的漏洞）──────────────────
-/// 漏掉它时，被关掉的别名仍会进候选名，然后在 [`builtin_target`] 里绕开
-/// 「映射分支」的启停判定走另一条路：`entry_id_in_manifest` 按 id 找不到会
-/// **回落到比对上一条目的展示名（`name`）**，命中后按 `default_enabled` 判定
-/// —— 那与别名映射的开关无关。于是「关了映射、`/v1/models` 里却还在」。
-/// 实测：`space-bunny-alpha`（与展示名逐字相同）会中，`mimo-v2.6-flash`
-/// （展示名是 `Mimo V2.6 Flash`，比不中）不会中 —— 同一个开关两种结果。
-/// 模块头那句「所有对外出口使用相同的开启绑定集合」说的就是这里必须过滤。
-fn advertised_names(
-    rules: &model_rules::ModelRules,
-    provider: &str,
-    manifest: &[Value],
-) -> Vec<String> {
-    let mut names: Vec<String> = manifest.iter().map(model_id).collect();
-    names.extend(rules.mappings.iter()
-        .filter(|mapping| mapping.enabled)
-        .filter(|mapping| mapping.provider.as_deref().map_or(true, |owner| owner == provider))
-        .map(|mapping| mapping.alias.clone()));
-    names
-}
 
 /// 先在各提供商内判断绑定，再按对外名去重；不能先合并上游 ID 再拼别名，
 /// 否则某家关闭的映射会借另一家的同名上游重新出现在列表中。
@@ -46,33 +23,24 @@ fn public_builtin_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(String, V
     let mut result = Vec::new();
     for (kind, manifest) in active {
         let provider = kind_id(*kind);
-        let names = advertised_names(&rules, provider, manifest);
-        for name in names {
-            let Some(wire) = builtin_target(&rules, *kind, manifest, &name) else { continue };
-            if !claimed.insert(name.to_lowercase()) {
-                continue;
-            }
-            let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else { continue };
-            let mut item = list_item(upstream, provider);
-            if let Some(object) = item.as_object_mut() {
-                object.insert("id".to_string(), Value::String(name.clone()));
-                if !name.eq_ignore_ascii_case(&wire.model) {
-                    object.insert("name".to_string(), Value::String(name));
-                    object.insert("is_default".to_string(), Value::Bool(false));
-                }
-            }
-            result.push((provider.to_string(), item));
-        }
+        result.extend(public_items_for_provider(
+            &rules,
+            provider,
+            manifest,
+            &mut claimed,
+        ));
     }
     result
 }
 
 pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value {
-    let active: Vec<_> = active_manifests(store).into_iter()
+    let active: Vec<_> = active_manifests(store)
+        .into_iter()
         .filter(|(kind, _)| key_scope::allows_provider(scope, kind_id(*kind)))
         .collect();
     let (source, refreshed_at) = aggregate_source(&active);
-    let mut data: Vec<_> = public_builtin_items(&active).into_iter()
+    let mut data: Vec<_> = public_builtin_items(&active)
+        .into_iter()
         .map(|(_, item)| item)
         .filter(|item| key_scope::allows_model(scope, &model_id(item)))
         .collect();
@@ -87,7 +55,11 @@ pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value 
     append_plugin_models(store, scope, &mut data);
     // 自定义家 / 插件家贡献了条目时，这份列表就不再是单/多家内置的来源了 ——
     // 与「多家内置」同一个词（aggregate），下游据此知道列表是拼出来的。
-    let source = if data.len() > builtin_count { "aggregate" } else { source };
+    let source = if data.len() > builtin_count {
+        "aggregate"
+    } else {
+        source
+    };
     list_response_from(data, source, refreshed_at)
 }
 
@@ -101,28 +73,26 @@ fn append_plugin_models(
     scope: Option<&KeyScope>,
     data: &mut Vec<Value>,
 ) -> usize {
-    let mut claimed: HashSet<String> = data.iter().map(|item| model_id(item).to_lowercase()).collect();
+    let mut claimed: HashSet<String> = data
+        .iter()
+        .map(|item| model_id(item).to_lowercase())
+        .collect();
     let before = data.len();
+    let rules = model_rules::current();
     for id in crate::server::core::plugin_host::installed_ids() {
-        if !key_scope::allows_provider(scope, &id) {
-            continue;
-        }
-        if store.accounts_for_provider(&id).is_empty() {
+        if !key_scope::allows_provider(scope, &id) || store.accounts_for_provider(&id).is_empty() {
             continue;
         }
         let Some(adapter) = crate::server::core::plugin_host::lookup(&id) else {
             continue;
         };
-        for model in adapter.list_models() {
-            let id_text = model_id(&model);
-            if id_text.is_empty() || !key_scope::allows_model(scope, &id_text) {
-                continue;
-            }
-            if !claimed.insert(id_text.to_lowercase()) {
-                continue;
-            }
-            data.push(list_item(&model, &id));
-        }
+        let manifest = adapter.list_models();
+        data.extend(
+            public_items_for_provider(&rules, &id, &manifest, &mut claimed)
+                .into_iter()
+                .map(|(_, item)| item)
+                .filter(|item| key_scope::allows_model(scope, &model_id(item))),
+        );
     }
     data.len() - before
 }
@@ -144,12 +114,17 @@ pub fn has_available_providers(store: &AccountStore) -> bool {
 }
 
 pub fn advertised_model_ids(store: &AccountStore) -> Vec<String> {
-    models_response(store, None).get("data").and_then(Value::as_array)
-        .map(|items| items.iter().map(model_id).collect()).unwrap_or_default()
+    models_response(store, None)
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(model_id).collect())
+        .unwrap_or_default()
 }
 
 pub fn advertised_manifest_contains(store: &AccountStore, model: &str) -> bool {
-    advertised_model_ids(store).iter().any(|id| id.eq_ignore_ascii_case(model))
+    advertised_model_ids(store)
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(model))
 }
 
 pub fn suggest_advertised(store: &AccountStore, model: &str, limit: usize) -> Vec<String> {
@@ -157,24 +132,42 @@ pub fn suggest_advertised(store: &AccountStore, model: &str, limit: usize) -> Ve
 }
 
 pub fn session_models(store: &AccountStore) -> Vec<Value> {
-    models_response(store, None).get("data").and_then(Value::as_array)
-        .cloned().unwrap_or_default().into_iter().map(|mut item| {
-            let provider = item.get("owned_by").and_then(Value::as_str).unwrap_or("").to_string();
-            let is_default = item.get("is_default").cloned().unwrap_or(Value::Bool(false));
+    models_response(store, None)
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut item| {
+            let provider = item
+                .get("owned_by")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let is_default = item
+                .get("is_default")
+                .cloned()
+                .unwrap_or(Value::Bool(false));
             if let Some(object) = item.as_object_mut() {
-                object.insert("providerLabel".to_string(), Value::String(super::super::label_of(&provider)));
+                object.insert(
+                    "providerLabel".to_string(),
+                    Value::String(super::super::label_of(&provider)),
+                );
                 object.insert("provider".to_string(), Value::String(provider));
                 object.insert("isDefault".to_string(), is_default);
             }
             item
-        }).collect()
+        })
+        .collect()
 }
 
 pub fn models_by_provider(store: &AccountStore) -> Value {
     let mut map = Map::new();
     for (kind, manifest) in active_manifests(store) {
-        let mut names: Vec<_> = public_builtin_items(&[(kind, manifest)]).into_iter()
-            .map(|(_, item)| model_id(&item)).collect();
+        let mut names: Vec<_> = public_builtin_items(&[(kind, manifest)])
+            .into_iter()
+            .map(|(_, item)| model_id(&item))
+            .collect();
         names.sort_by_key(|name| name.to_lowercase());
         map.insert(kind_id(kind).to_string(), json!(names));
     }
@@ -184,11 +177,17 @@ pub fn models_by_provider(store: &AccountStore) -> Value {
         map.insert(provider, json!(names));
     }
     // 插件家（网关 Key 的「可用模型」多选按 provider 分组读这张表）
+    let rules = model_rules::current();
     for id in crate::server::core::plugin_host::installed_ids() {
         let Some(adapter) = crate::server::core::plugin_host::lookup(&id) else {
             continue;
         };
-        let mut names: Vec<String> = adapter.list_models().iter().map(model_id).collect();
+        let mut claimed = HashSet::new();
+        let mut names: Vec<String> =
+            public_items_for_provider(&rules, &id, &adapter.list_models(), &mut claimed)
+                .into_iter()
+                .map(|(_, item)| model_id(&item))
+                .collect();
         names.sort_by_key(|name| name.to_lowercase());
         map.insert(id, json!(names));
     }
@@ -232,13 +231,24 @@ fn push_managed_model(
     let mut aliases = Vec::new();
     for (index, mapping) in rules.mappings.iter().enumerate() {
         if !mapping.target.eq_ignore_ascii_case(&id)
-            || !mapping.provider.as_deref().map_or(true, |owner| owner == provider)
-        { continue; }
+            || !mapping
+                .provider
+                .as_deref()
+                .map_or(true, |owner| owner.eq_ignore_ascii_case(provider))
+        {
+            continue;
+        }
         attached.insert(index);
         if mapping.alias.eq_ignore_ascii_case(&id)
-            || aliases.iter().any(|alias: &String| alias.eq_ignore_ascii_case(&mapping.alias))
-        { continue; }
-        let Some(effective) = rules.binding(provider, &mapping.alias, &id) else { continue };
+            || aliases
+                .iter()
+                .any(|alias: &String| alias.eq_ignore_ascii_case(&mapping.alias))
+        {
+            continue;
+        }
+        let Some(effective) = rules.binding(provider, &mapping.alias, &id) else {
+            continue;
+        };
         aliases.push(mapping.alias.clone());
         mappings.push(json!({
             "alias": effective.alias, "target": id, "provider": provider,
@@ -246,9 +256,15 @@ fn push_managed_model(
             "isDefault": false, "dangling": false, "carried": true,
         }));
     }
-    let source = if rules.custom.iter().any(|custom| custom.matches(provider, &id)) {
+    let source = if rules
+        .custom
+        .iter()
+        .any(|custom| custom.matches(provider, &id))
+    {
         "manual"
-    } else { source };
+    } else {
+        source
+    };
     // 覆盖键列表从**本次快照**里查（不调 model_rules::current() —— 那会
     // 每行重新解析一遍配置，几百行的清单就是几百次解析）
     let cap_overrides: Vec<String> = rules
@@ -326,8 +342,15 @@ pub fn manage_view(store: &AccountStore) -> Value {
         let source = if remote { "remote" } else { "builtin" };
         for item in manifest {
             push_managed_model(
-                &rules, &mut models, &mut mappings, &mut attached, &mut claimed,
-                provider, source, refreshed_at, item,
+                &rules,
+                &mut models,
+                &mut mappings,
+                &mut attached,
+                &mut claimed,
+                provider,
+                source,
+                refreshed_at,
+                item,
             );
         }
     }
@@ -356,13 +379,22 @@ pub fn manage_view(store: &AccountStore) -> Value {
         manifest.sort_by_key(|item| !rules.default_enabled(&id, &model_id(item)));
         for item in manifest {
             push_managed_model(
-                &rules, &mut models, &mut mappings, &mut attached, &mut claimed,
-                &id, "remote", 0, item,
+                &rules,
+                &mut models,
+                &mut mappings,
+                &mut attached,
+                &mut claimed,
+                &id,
+                "remote",
+                0,
+                item,
             );
         }
     }
     for (index, mapping) in rules.mappings.iter().enumerate() {
-        if attached.contains(&index) { continue; }
+        if attached.contains(&index) {
+            continue;
+        }
         let carried = match mapping.provider.as_deref() {
             Some(provider) => kind_from_id(provider).is_some_and(|kind| {
                 entry_id_in_manifest(&manifest_for(kind), &mapping.target).is_some()
@@ -402,6 +434,14 @@ mod tests {
         vec![json!({ "id": "stealth/space-bunny-alpha", "name": "space-bunny-alpha" })]
     }
 
+    fn advertised_ids(rules: &model_rules::ModelRules) -> Vec<String> {
+        let mut claimed = HashSet::new();
+        public_items_for_provider(rules, "cline-free", &manifest(), &mut claimed)
+            .into_iter()
+            .map(|(_, item)| model_id(&item))
+            .collect()
+    }
+
     /// 被关掉的映射别名不能进广告候选名。漏了这道过滤时，别名会经由
     /// `builtin_target` 的「展示名回落」绕开启停判定 —— 于是「关了映射，
     /// `/v1/models` 里却还在」（2026-10-03 实测复现）。
@@ -411,7 +451,7 @@ mod tests {
             { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
               "provider": "cline-free", "enabled": false }
         ]));
-        let names = advertised_names(&rules, "cline-free", &manifest());
+        let names = advertised_ids(&rules);
         assert!(
             !names.iter().any(|name| name == "space-bunny-alpha"),
             "关掉的别名不该出现在候选名里: {names:?}"
@@ -427,7 +467,7 @@ mod tests {
             { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
               "provider": "cline-free", "enabled": true }
         ]));
-        let names = advertised_names(&rules, "cline-free", &manifest());
+        let names = advertised_ids(&rules);
         assert!(names.iter().any(|name| name == "space-bunny-alpha"));
     }
 
@@ -438,7 +478,7 @@ mod tests {
             { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
               "provider": "cline-free" }
         ]));
-        let names = advertised_names(&rules, "cline-free", &manifest());
+        let names = advertised_ids(&rules);
         assert!(names.iter().any(|name| name == "space-bunny-alpha"));
     }
 
@@ -449,7 +489,23 @@ mod tests {
             { "alias": "x-alias", "target": "stealth/space-bunny-alpha",
               "provider": "workbuddy", "enabled": true }
         ]));
-        let names = advertised_names(&rules, "cline-free", &manifest());
+        let names = advertised_ids(&rules);
         assert!(!names.iter().any(|name| name == "x-alias"));
+    }
+
+    #[test]
+    fn runtime_provider_alias_is_advertised_against_its_target() {
+        let rules = rules_with(json!([
+            { "alias": "luna1", "target": "Qwen3.8-Flash", "provider": "qoder" }
+        ]));
+        let manifest = vec![json!({ "id": "Qwen3.8-Flash", "name": "Qwen 3.8 Flash" })];
+        let mut claimed = HashSet::new();
+        let items = public_items_for_provider(&rules, "qoder", &manifest, &mut claimed);
+        let alias = items
+            .iter()
+            .find(|(_, item)| model_id(item) == "luna1")
+            .expect("mapped alias should be advertised");
+        assert_eq!(alias.1["owned_by"], "qoder");
+        assert_eq!(alias.1["name"], "luna1");
     }
 }

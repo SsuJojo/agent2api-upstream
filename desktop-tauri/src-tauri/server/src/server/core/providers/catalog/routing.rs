@@ -8,11 +8,13 @@
 //! 单个答案的入口（`wire_target_for_provider` / `builtin_target`）保留，
 //! 取链上第一位 —— 于是**不消费候选链的调用方行为逐字不变**。
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
-use crate::server::core::{custom_providers, model_rules};
 use crate::server::core::models::model_id;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
+use crate::server::core::{custom_providers, model_rules};
 
 use super::{adapter_for, all_kinds, manifest_for};
 
@@ -28,12 +30,17 @@ pub(super) fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Optio
         return None;
     }
     // 保留展示名兼容，但必须先匹配原始 ID；返回清单里的实际大小写。
-    manifest.iter().find(|entry| model_id(entry).eq_ignore_ascii_case(requested))
-        .or_else(|| manifest.iter().find(|entry| {
-            entry.get("name")
-                .map(crate::server::core::models::shape_value_text)
-                .is_some_and(|name| name.eq_ignore_ascii_case(requested))
-        }))
+    manifest
+        .iter()
+        .find(|entry| model_id(entry).eq_ignore_ascii_case(requested))
+        .or_else(|| {
+            manifest.iter().find(|entry| {
+                entry
+                    .get("name")
+                    .map(crate::server::core::models::shape_value_text)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+            })
+        })
         .map(model_id)
 }
 
@@ -43,7 +50,164 @@ pub(super) fn builtin_target(
     manifest: &[Value],
     requested: &str,
 ) -> Option<WireTarget> {
-    target_candidates(rules, kind, manifest, requested).into_iter().next()
+    target_candidates(rules, kind, manifest, requested)
+        .into_iter()
+        .next()
+}
+
+/// Resolve aliases for any provider identity, including providers registered at runtime.
+/// The compile-time wrapper below preserves Cline's pool-specific candidate ordering.
+pub(super) fn target_candidates_for_provider(
+    rules: &model_rules::ModelRules,
+    provider: &str,
+    manifest: &[Value],
+    requested: &str,
+) -> Vec<WireTarget> {
+    target_candidates_with_prefix(
+        rules,
+        provider,
+        manifest,
+        requested,
+        kind_from_id(provider).and_then(|kind| {
+            super::super::cline::models::Pool::from_provider_id(kind_id(kind))
+                .map(super::super::cline::models::Pool::target_prefix)
+        }),
+    )
+}
+
+fn target_candidates_with_prefix(
+    rules: &model_rules::ModelRules,
+    provider: &str,
+    manifest: &[Value],
+    requested: &str,
+    prefix: Option<&'static str>,
+) -> Vec<WireTarget> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    if let Some(id) = entry_id_in_manifest(manifest, requested) {
+        if rules.default_enabled(provider, &id) {
+            return vec![WireTarget {
+                reasoning: rules
+                    .binding(provider, &id, &id)
+                    .and_then(|m| m.reasoning.clone()),
+                model: id,
+            }];
+        }
+    }
+    let candidates: Vec<_> = rules
+        .mappings
+        .iter()
+        .filter(|mapping| mapping.alias.eq_ignore_ascii_case(requested))
+        .filter(|mapping| !mapping.alias.eq_ignore_ascii_case(&mapping.target))
+        .filter(|mapping| {
+            mapping
+                .provider
+                .as_deref()
+                .map_or(true, |id| id.eq_ignore_ascii_case(provider))
+        })
+        .filter(|mapping| {
+            rules
+                .binding(provider, &mapping.alias, &mapping.target)
+                .is_some_and(|effective| effective.enabled)
+        })
+        .filter_map(|mapping| {
+            entry_id_in_manifest(manifest, &mapping.target).map(|target| (mapping, target))
+        })
+        .collect();
+    let mut out: Vec<WireTarget> = Vec::with_capacity(candidates.len());
+    let mut rest: Vec<&(&model_rules::Mapping, String)> = Vec::with_capacity(candidates.len());
+    let mut tail: Vec<&(&model_rules::Mapping, String)> = Vec::new();
+    for entry in &candidates {
+        match (
+            entry.0.provider.is_some(),
+            prefix.is_some_and(|p| entry.1.starts_with(p)),
+        ) {
+            (true, true) => out.push(wire_of(rules, provider, entry)),
+            (true, false) => rest.push(entry),
+            (false, _) => tail.push(entry),
+        }
+    }
+    out.extend(rest.iter().map(|entry| wire_of(rules, provider, entry)));
+    out.extend(tail.iter().map(|entry| wire_of(rules, provider, entry)));
+    out
+}
+
+/// Runtime-provider equivalent of `builtin_target`.
+pub(super) fn target_for_provider(
+    rules: &model_rules::ModelRules,
+    provider: &str,
+    manifest: &[Value],
+    requested: &str,
+) -> Option<WireTarget> {
+    target_candidates_for_provider(rules, provider, manifest, requested)
+        .into_iter()
+        .next()
+}
+
+/// A runtime provider manifest, if that provider is currently registered.
+pub(super) fn plugin_manifest(provider: &str) -> Option<Vec<Value>> {
+    crate::server::core::plugin_host::lookup(provider).map(|adapter| adapter.list_models())
+}
+
+/// Plugin registration takes precedence for ids that also exist in the built-in enum.
+fn prefer_plugin_manifest(
+    plugin: Option<Vec<Value>>,
+    builtin: impl FnOnce() -> Option<Vec<Value>>,
+) -> Option<Vec<Value>> {
+    plugin.or_else(builtin)
+}
+
+fn manifest_for_provider(provider: &str) -> Option<Vec<Value>> {
+    prefer_plugin_manifest(plugin_manifest(provider), || {
+        kind_from_id(provider).map(manifest_for)
+    })
+}
+
+/// Advertised names for one provider using the same mapping and target validation as routing.
+pub(super) fn public_items_for_provider(
+    rules: &model_rules::ModelRules,
+    provider: &str,
+    manifest: &[Value],
+    claimed: &mut HashSet<String>,
+) -> Vec<(String, Value)> {
+    let mut result = Vec::new();
+    let mut names: Vec<String> = manifest.iter().map(model_id).collect();
+    names.extend(
+        rules
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.enabled)
+            .filter(|mapping| {
+                mapping
+                    .provider
+                    .as_deref()
+                    .map_or(true, |owner| owner.eq_ignore_ascii_case(provider))
+            })
+            .map(|mapping| mapping.alias.clone()),
+    );
+    for name in names {
+        let Some(wire) = target_for_provider(rules, provider, manifest, &name) else {
+            continue;
+        };
+        let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else {
+            continue;
+        };
+        if !claimed.insert(name.to_lowercase()) {
+            continue;
+        }
+        let mut item = crate::server::core::models::list_item(upstream, provider);
+        if let Some(object) = item.as_object_mut() {
+            object.insert("id".to_string(), Value::String(name.clone()));
+            if !name.eq_ignore_ascii_case(&wire.model) {
+                object.insert("name".to_string(), Value::String(name));
+                object.insert("is_default".to_string(), Value::Bool(false));
+            }
+        }
+        result.push((provider.to_string(), item));
+    }
+    result
 }
 
 /// 一家对某请求名的**全部**候选目标，按应当尝试的顺序排列。
@@ -81,48 +245,7 @@ pub(super) fn target_candidates(
     manifest: &[Value],
     requested: &str,
 ) -> Vec<WireTarget> {
-    let provider = kind_id(kind);
-    // ⓪ 原生承载：命中就到此为止（见函数头 ①）
-    if let Some(id) = entry_id_in_manifest(manifest, requested) {
-        if rules.default_enabled(provider, &id) {
-            return vec![WireTarget {
-                reasoning: rules.binding(provider, &id, &id).and_then(|m| m.reasoning.clone()),
-                model: id,
-            }];
-        }
-    }
-    let candidates: Vec<_> = rules.mappings.iter()
-        .filter(|mapping| mapping.alias.eq_ignore_ascii_case(requested))
-        .filter(|mapping| !mapping.alias.eq_ignore_ascii_case(&mapping.target))
-        .filter(|mapping| mapping.provider.as_deref().map_or(true, |id| id == provider))
-        .filter(|mapping| rules.binding(provider, &mapping.alias, &mapping.target)
-            .is_some_and(|effective| effective.enabled))
-        .filter_map(|mapping| {
-            entry_id_in_manifest(manifest, &mapping.target).map(|target| (mapping, target))
-        })
-        .collect();
-    let prefix = super::super::cline::models::Pool::from_provider_id(provider)
-        .map(super::super::cline::models::Pool::target_prefix);
-    // 分组顺序即尝试顺序（见函数头 ①②③④）。组内保持 `rules.mappings` 的
-    // 配置顺序 —— 稳定分区，不用 sort（那会按 target 字典序重排候选，
-    // 与旧实现「先建先用」的口径分叉）。
-    let mut out: Vec<WireTarget> = Vec::with_capacity(candidates.len());
-    let mut rest: Vec<&(&model_rules::Mapping, String)> = Vec::with_capacity(candidates.len());
-    let mut tail: Vec<&(&model_rules::Mapping, String)> = Vec::new();
-    for entry in &candidates {
-        match (entry.0.provider.is_some(), prefix.is_some_and(|p| entry.1.starts_with(p))) {
-            // ② 池前缀优先级最高（Cline 两条池现在是两家 provider，
-            //    带本池前缀的 target 才是这一家真正认的发送名）
-            (true, true) => out.push(wire_of(rules, provider, entry)),
-            // ③ 其余带 provider 的条目先进缓冲，② 全部收完再按原序接上
-            (true, false) => rest.push(entry),
-            // ④ 旧版全局条目垫底
-            (false, _) => tail.push(entry),
-        }
-    }
-    out.extend(rest.iter().map(|entry| wire_of(rules, provider, entry)));
-    out.extend(tail.iter().map(|entry| wire_of(rules, provider, entry)));
-    out
+    target_candidates_for_provider(rules, kind_id(kind), manifest, requested)
 }
 
 /// 一条候选 → 发送目标（思考等级跟着那条映射走，与旧实现同源）。
@@ -133,7 +256,8 @@ fn wire_of(
 ) -> WireTarget {
     WireTarget {
         model: entry.1.clone(),
-        reasoning: rules.binding(provider, &entry.0.alias, &entry.0.target)
+        reasoning: rules
+            .binding(provider, &entry.0.alias, &entry.0.target)
             .and_then(|effective| effective.reasoning.clone()),
     }
 }
@@ -149,20 +273,33 @@ pub fn providers_for_model(model: &str) -> Vec<String> {
     if model.is_empty() {
         return Vec::new();
     }
-    let manifests: Vec<_> = all_kinds().into_iter().map(|kind| (kind, manifest_for(kind))).collect();
+    let manifests: Vec<_> = all_kinds()
+        .into_iter()
+        .map(|kind| (kind, manifest_for(kind)))
+        .collect();
     let exact = manifests.iter().any(|(_, items)| {
-        items.iter().any(|item| model_id(item).eq_ignore_ascii_case(model))
+        items
+            .iter()
+            .any(|item| model_id(item).eq_ignore_ascii_case(model))
     });
-    let mut result: Vec<_> = manifests.into_iter().filter(|(_, items)| {
-        if exact {
-            items.iter().any(|item| model_id(item).eq_ignore_ascii_case(model))
-        } else {
-            entry_id_in_manifest(items, model).is_some()
-        }
-    }).map(|(kind, _)| kind_id(kind).to_string()).collect();
+    let mut result: Vec<_> = manifests
+        .into_iter()
+        .filter(|(_, items)| {
+            if exact {
+                items
+                    .iter()
+                    .any(|item| model_id(item).eq_ignore_ascii_case(model))
+            } else {
+                entry_id_in_manifest(items, model).is_some()
+            }
+        })
+        .map(|(kind, _)| kind_id(kind).to_string())
+        .collect();
     result.extend(custom_providers::list().into_iter().filter_map(|provider| {
         let models = provider.get("models")?.as_array()?;
-        let declared = models.iter().any(|entry| model_id(entry).eq_ignore_ascii_case(model));
+        let declared = models
+            .iter()
+            .any(|entry| model_id(entry).eq_ignore_ascii_case(model));
         // 映射别名也算「这一家认识这个名字」：别名是对外可请求的名字，
         // 判定口径与 `carriers_of_model` 的「能力」那一半一致。
         let mapped = provider
@@ -176,8 +313,13 @@ pub fn providers_for_model(model: &str) -> Vec<String> {
                         .is_some_and(|alias| alias.eq_ignore_ascii_case(model))
                 })
             });
-        (declared || mapped)
-            .then(|| provider.get("id").and_then(Value::as_str).unwrap_or("").to_string())
+        (declared || mapped).then(|| {
+            provider
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
     }));
     // 插件家：清单由它们在握手 / 刷新时申报。不加这一段，「按映射名建到插件家」
     // 与「模型规则页里选插件家」都会被判成「这家不认识这个名字」。
@@ -189,13 +331,13 @@ pub fn providers_for_model(model: &str) -> Vec<String> {
             .list_models()
             .iter()
             .any(|entry| model_id(entry).eq_ignore_ascii_case(model));
-        let mapped = model_rules::current()
-            .mappings
-            .iter()
-            .any(|mapping| {
-                mapping.provider.as_deref() == Some(id.as_str())
-                    && mapping.alias.eq_ignore_ascii_case(model)
-            });
+        let mapped = model_rules::current().mappings.iter().any(|mapping| {
+            mapping
+                .provider
+                .as_deref()
+                .map_or(true, |owner| owner.eq_ignore_ascii_case(&id))
+                && mapping.alias.eq_ignore_ascii_case(model)
+        });
         if declared || mapped {
             result.push(id);
         }
@@ -206,12 +348,14 @@ pub fn providers_for_model(model: &str) -> Vec<String> {
 /// 只返回有开启绑定的提供商，不把关闭的 ID 回落给默认提供商。
 pub fn forwarding_providers(model: &str) -> Vec<String> {
     let rules = model_rules::current();
-    let mut result: Vec<_> = all_kinds().into_iter().filter(|kind| {
-        builtin_target(&rules, *kind, &manifest_for(*kind), model).is_some()
-    }).map(|kind| kind_id(kind).to_string()).collect();
+    let mut result: Vec<_> = all_kinds()
+        .into_iter()
+        .filter(|kind| builtin_target(&rules, *kind, &manifest_for(*kind), model).is_some())
+        .map(|kind| kind_id(kind).to_string())
+        .collect();
     result.extend(custom_providers::carriers_of_model(model));
-    // 插件家：名字改写由插件自己做（它知道自己的目录），网关这边只要能回答
-    // 「这个名字归这家」即可。判据与 `providers_for_model` 的插件段一致。
+    // 插件家共享同一映射解析器：只有目录里存在的目标才算可转发，
+    // 避免配置了失效映射时把别名交给插件并原样发送。
     for id in crate::server::core::plugin_host::installed_ids() {
         if !rules.default_enabled(&id, model) {
             continue;
@@ -219,16 +363,8 @@ pub fn forwarding_providers(model: &str) -> Vec<String> {
         let Some(adapter) = crate::server::core::plugin_host::lookup(&id) else {
             continue;
         };
-        let declared = adapter
-            .list_models()
-            .iter()
-            .any(|entry| model_id(entry).eq_ignore_ascii_case(model));
-        let mapped = rules.mappings.iter().any(|mapping| {
-            mapping.provider.as_deref() == Some(id.as_str())
-                && mapping.alias.eq_ignore_ascii_case(model)
-                && mapping.enabled
-        });
-        if declared || mapped {
+        let manifest = adapter.list_models();
+        if !target_candidates_for_provider(&rules, &id, &manifest, model).is_empty() {
             result.push(id);
         }
     }
@@ -242,20 +378,35 @@ pub fn model_blocked_everywhere(model: &str) -> bool {
     !providers_for_model(model).is_empty()
         || model_rules::current().has_alias(model)
         || custom_providers::list().iter().any(|provider| {
-            provider.get("mappings").and_then(Value::as_array).is_some_and(|mappings| {
-                mappings.iter().any(|mapping| mapping.get("alias").and_then(Value::as_str)
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(model)))
-            })
+            provider
+                .get("mappings")
+                .and_then(Value::as_array)
+                .is_some_and(|mappings| {
+                    mappings.iter().any(|mapping| {
+                        mapping
+                            .get("alias")
+                            .and_then(Value::as_str)
+                            .is_some_and(|alias| alias.eq_ignore_ascii_case(model))
+                    })
+                })
         })
 }
 
-pub fn wire_target_for_provider(model: &str, provider_id: &str, _account: Option<&Value>) -> WireTarget {
+pub fn wire_target_for_provider(
+    model: &str,
+    provider_id: &str,
+    _account: Option<&Value>,
+) -> WireTarget {
     let requested = model.trim();
     // 自定义提供商在自己的转发模块解析一次，避免把别名提前改写后丢失其等级绑定。
-    let resolved = kind_from_id(provider_id).and_then(|kind| {
-        builtin_target(&model_rules::current(), kind, &manifest_for(kind), requested)
-    });
-    resolved.unwrap_or_else(|| WireTarget { model: requested.to_string(), reasoning: None })
+    let rules = model_rules::current();
+    let manifest = manifest_for_provider(provider_id);
+    manifest
+        .and_then(|manifest| target_for_provider(&rules, provider_id, &manifest, requested))
+        .unwrap_or_else(|| WireTarget {
+            model: requested.to_string(),
+            reasoning: None,
+        })
 }
 
 /// 一家对某请求名的**全部**候选目标（有序，见 [`target_candidates`] 的顺序约定）。
@@ -269,24 +420,36 @@ pub fn wire_target_for_provider(model: &str, provider_id: &str, _account: Option
 /// `_account` 与 [`wire_target_for_provider`] 同名同义：候选链是按家算的，
 /// 同家的账号共享同一份清单与规则（账号唯一影响发送时的池判定，见
 /// `provider_loop` 的 send_cache 键），发送侧因此不按账号重算。
-pub fn wire_targets_for_provider(model: &str, provider_id: &str, _account: Option<&Value>) -> Vec<WireTarget> {
+pub fn wire_targets_for_provider(
+    model: &str,
+    provider_id: &str,
+    _account: Option<&Value>,
+) -> Vec<WireTarget> {
     let requested = model.trim();
     if requested.is_empty() {
         return Vec::new();
     }
-    kind_from_id(provider_id)
-        .map(|kind| target_candidates(&model_rules::current(), kind, &manifest_for(kind), requested))
+    let rules = model_rules::current();
+    let manifest = manifest_for_provider(provider_id);
+    manifest
+        .map(|manifest| target_candidates_for_provider(&rules, provider_id, &manifest, requested))
         .unwrap_or_default()
 }
 
 pub fn default_model_catalog() -> Vec<Value> {
     let rules = model_rules::current();
     let mut result = Vec::new();
-    for kind in all_kinds().into_iter().filter(|kind| adapter_for(*kind).supports_default_model()) {
+    for kind in all_kinds()
+        .into_iter()
+        .filter(|kind| adapter_for(*kind).supports_default_model())
+    {
         for entry in manifest_for(kind) {
             let id = model_id(&entry);
-            if !id.is_empty() && rules.default_enabled(kind_id(kind), &id)
-                && !result.iter().any(|item| model_id(item).eq_ignore_ascii_case(&id))
+            if !id.is_empty()
+                && rules.default_enabled(kind_id(kind), &id)
+                && !result
+                    .iter()
+                    .any(|item| model_id(item).eq_ignore_ascii_case(&id))
             {
                 result.push(entry);
             }
@@ -371,10 +534,11 @@ mod tests {
         let mut manifest = manifest();
         manifest.push(json!({ "id": "zeta", "name": "Zeta" }));
         manifest.push(json!({ "id": "alpha", "name": "Alpha" }));
-        let got: Vec<String> = target_candidates(&rules, ProviderKind::WorkBuddy, &manifest, "free")
-            .into_iter()
-            .map(|wire| wire.model)
-            .collect();
+        let got: Vec<String> =
+            target_candidates(&rules, ProviderKind::WorkBuddy, &manifest, "free")
+                .into_iter()
+                .map(|wire| wire.model)
+                .collect();
         assert_eq!(got, vec!["zeta", "alpha"]);
     }
 
@@ -390,8 +554,10 @@ mod tests {
             { "alias": "glm", "target": "z-ai/glm-5.3-flash", "provider": "cline-free", "enabled": true },
             { "alias": "glm", "target": "cline-free/glm-5.3-flash", "provider": "cline-free", "enabled": true },
         ]));
-        let manifest = vec![json!({ "id": "cline-free/glm-5.3-flash", "name": "Cline Free GLM Flash" }),
-                            json!({ "id": "z-ai/glm-5.3-flash", "name": "Z AI GLM Flash" })];
+        let manifest = vec![
+            json!({ "id": "cline-free/glm-5.3-flash", "name": "Cline Free GLM Flash" }),
+            json!({ "id": "z-ai/glm-5.3-flash", "name": "Z AI GLM Flash" }),
+        ];
         let got: Vec<String> = target_candidates(&rules, ProviderKind::ClineFree, &manifest, "glm")
             .into_iter()
             .map(|wire| wire.model)
@@ -416,5 +582,59 @@ mod tests {
             { "alias": "free", "target": "model-a", "provider": "raccoon", "enabled": true },
         ]));
         assert!(targets(&rules, "free").is_empty());
+    }
+
+    #[test]
+    fn runtime_provider_mapping_resolves_alias_to_canonical_manifest_id() {
+        let manifest = vec![json!({ "id": "Qwen3.8-Flash", "name": "Qwen 3.8 Flash" })];
+        let rules = rules_with(json!([
+            { "alias": "luna1", "target": "qwen3.8-flash", "provider": "qoder" }
+        ]));
+        let chain = target_candidates_for_provider(&rules, "qoder", &manifest, "luna1");
+        assert_eq!(
+            chain,
+            vec![WireTarget {
+                model: "Qwen3.8-Flash".into(),
+                reasoning: None
+            }]
+        );
+    }
+
+    #[test]
+    fn runtime_provider_mapping_rejects_disabled_or_unavailable_targets() {
+        let manifest = vec![json!({ "id": "Qwen3.8-Flash" })];
+        let disabled = rules_with(json!([
+            { "alias": "luna1", "target": "Qwen3.8-Flash", "provider": "qoder", "enabled": false }
+        ]));
+        assert!(target_candidates_for_provider(&disabled, "qoder", &manifest, "luna1").is_empty());
+
+        let unavailable = rules_with(json!([
+            { "alias": "luna1", "target": "not-in-catalog", "provider": "qoder" }
+        ]));
+        assert!(
+            target_candidates_for_provider(&unavailable, "qoder", &manifest, "luna1").is_empty()
+        );
+    }
+
+    #[test]
+    fn plugin_manifest_wins_for_provider_ids_also_known_to_builtin_catalog() {
+        let plugin = vec![json!({ "id": "GLM-5.3-Flash" })];
+        let builtin = vec![json!({ "id": "builtin-placeholder-model" })];
+        let selected = prefer_plugin_manifest(Some(plugin.clone()), || Some(builtin))
+            .expect("registered plugin manifest should be selected");
+        let rules = rules_with(json!([
+            { "alias": "test", "target": "glm-5.3-flash", "provider": "zcode" }
+        ]));
+        let chain = target_candidates_for_provider(&rules, "zcode", &selected, "test");
+        assert_eq!(chain[0].model, "GLM-5.3-Flash");
+    }
+
+    #[test]
+    fn runtime_provider_mapping_keeps_provider_isolation() {
+        let manifest = vec![json!({ "id": "Qwen3.8-Flash" })];
+        let rules = rules_with(json!([
+            { "alias": "luna1", "target": "Qwen3.8-Flash", "provider": "qoder-intl" }
+        ]));
+        assert!(target_candidates_for_provider(&rules, "qoder", &manifest, "luna1").is_empty());
     }
 }

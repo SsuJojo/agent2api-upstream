@@ -1049,12 +1049,24 @@ pub fn responses_from_chat(chat: &Value, model: &str, request: &Value) -> Value 
         .get(FIELD_ENCRYPTED_CONTENT)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty());
-    if !reasoning.is_empty() || encrypted.is_some() {
-        let id = encrypted
-            .and_then(|_| message.get(FIELD_REASONING_ITEM_ID))
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
+    let original_reasoning_id = message
+        .get(FIELD_REASONING_ITEM_ID)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    let continuity = match (original_reasoning_id, encrypted) {
+        (Some(id), Some(encrypted)) => Some((id, encrypted)),
+        (None, Some(_)) => {
+            crate::server::logging::log(
+                "[Responses]",
+                "⚠️ reasoning encrypted_content 缺少原始 item_id；已丢弃连续性载荷",
+            );
+            None
+        }
+        _ => None,
+    };
+    if !reasoning.is_empty() || continuity.is_some() {
+        let id = continuity
+            .map(|(id, _)| id.to_string())
             .unwrap_or_else(|| random_id("rs"));
         let mut item = json!({
             "type": "reasoning",
@@ -1065,7 +1077,7 @@ pub fn responses_from_chat(chat: &Value, model: &str, request: &Value) -> Value 
                 vec![json!({ "type": "summary_text", "text": reasoning })]
             },
         });
-        if let Some(encrypted) = encrypted {
+        if let Some((_, encrypted)) = continuity {
             if let Some(object) = item.as_object_mut() {
                 object.insert(
                     "encrypted_content".to_string(),
@@ -1320,6 +1332,8 @@ pub struct ResponsesStream {
     reasoning_closed: bool,
     reasoning_index: i64,
     reasoning_id: String,
+    /// reasoning_id 是否来自上游原始 reasoning item；随机兜底 ID 不能绑定密文。
+    reasoning_id_is_original: bool,
     reasoning: String,
     /// store=false 时与 reasoning_id 成对回传的连续性载荷
     reasoning_encrypted: Option<String>,
@@ -1375,6 +1389,7 @@ impl ResponsesStream {
             reasoning_closed: false,
             reasoning_index: -1,
             reasoning_id: String::new(),
+            reasoning_id_is_original: false,
             reasoning: String::new(),
             reasoning_encrypted: None,
             tools: std::collections::BTreeMap::new(),
@@ -1757,15 +1772,39 @@ impl ResponsesStream {
         if item_id.is_empty() && encrypted.is_empty() {
             return Vec::new();
         }
-        if !self.reasoning_open && !item_id.is_empty() {
-            self.reasoning_id = item_id;
+
+        if !item_id.is_empty() {
+            if !self.reasoning_open {
+                self.reasoning_id = item_id.clone();
+                self.reasoning_id_is_original = true;
+            } else if self.reasoning_id_is_original && self.reasoning_id != item_id {
+                // 已打开的 reasoning 项身份不可再改；不同 ID 的密文不能绑定到它。
+                crate::server::logging::log(
+                    "[Responses]",
+                    "⚠️ reasoning item_id 在输出项打开后发生变化；已丢弃不匹配的连续性载荷",
+                );
+                return Vec::new();
+            }
         }
+
         if !encrypted.is_empty() {
-            self.reasoning_encrypted = Some(encrypted);
+            // 随机生成的 item ID 不是密文的原始身份。迟到的真实 ID 也无法
+            // 改写已发送的 output_item.added，因此密文必须被丢弃而不能错配。
+            if !self.reasoning_id_is_original
+                || (!item_id.is_empty() && self.reasoning_id != item_id)
+            {
+                crate::server::logging::log(
+                    "[Responses]",
+                    "⚠️ reasoning encrypted_content 缺少匹配的原始 item_id；已丢弃连续性载荷",
+                );
+            } else {
+                self.reasoning_encrypted = Some(encrypted);
+            }
         }
-        // encrypted-only 的 reasoning 也要成为一个真实的 output item，否则
-        // store=false 的下一轮没有可回传的连续性载荷。
-        if !self.reasoning_open {
+
+        // encrypted-only 的 reasoning 只有在保有原始 item_id 时才能输出，
+        // 否则 open_reasoning 会生成随机 ID 并把密文错配到该 ID。
+        if !self.reasoning_open && self.reasoning_id_is_original {
             return self.open_reasoning();
         }
         Vec::new()
@@ -2129,6 +2168,13 @@ impl ResponsesCollector {
         self.reasoning.push_str(&reasoning);
         let reasoning_id = string_field(delta, FIELD_REASONING_ITEM_ID);
         if !reasoning_id.is_empty() {
+            if !self.reasoning_id.is_empty() && self.reasoning_id != reasoning_id {
+                self.reasoning_encrypted = None;
+                crate::server::logging::log(
+                    "[Responses]",
+                    "⚠️ 聚合的 reasoning item_id 发生变化；已丢弃先前连续性载荷",
+                );
+            }
             self.reasoning_id = reasoning_id;
         }
         let encrypted = string_field(delta, FIELD_ENCRYPTED_CONTENT);
@@ -2161,7 +2207,18 @@ impl ResponsesCollector {
     pub fn into_response(self, model: &str, request: &Value) -> Value {
         let plan = tool_plan::plan_tools(request);
         let mut output: Vec<Value> = Vec::new();
-        if !self.reasoning.is_empty() || self.reasoning_encrypted.is_some() {
+        let reasoning_encrypted = if self.reasoning_id.is_empty() {
+            if self.reasoning_encrypted.is_some() {
+                crate::server::logging::log(
+                    "[Responses]",
+                    "⚠️ 聚合的 reasoning encrypted_content 缺少原始 item_id；已丢弃连续性载荷",
+                );
+            }
+            None
+        } else {
+            self.reasoning_encrypted
+        };
+        if !self.reasoning.is_empty() || reasoning_encrypted.is_some() {
             let id = if self.reasoning_id.is_empty() {
                 random_id("rs")
             } else {
@@ -2176,7 +2233,7 @@ impl ResponsesCollector {
                     vec![json!({ "type": "summary_text", "text": self.reasoning })]
                 },
             });
-            if let Some(encrypted) = self.reasoning_encrypted {
+            if let Some(encrypted) = reasoning_encrypted {
                 if let Some(object) = item.as_object_mut() {
                     object.insert(
                         "encrypted_content".to_string(),
@@ -2230,5 +2287,66 @@ impl ResponsesCollector {
 impl Default for ResponsesCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+
+    fn chat_frame(delta: Value) -> Vec<u8> {
+        format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": delta, "finish_reason": Value::Null }] })
+        )
+        .into_bytes()
+    }
+
+    fn rendered(frames: Vec<bytes::Bytes>) -> String {
+        frames
+            .into_iter()
+            .map(|frame| String::from_utf8_lossy(&frame).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn streamed_continuity_keeps_the_original_id() {
+        let mut stream = ResponsesStream::new("m", &json!({}));
+        let first = stream.push(&chat_frame(json!({
+            (FIELD_REASONING_ITEM_ID): "rs_original",
+            (FIELD_ENCRYPTED_CONTENT): "enc",
+        })));
+        let second = stream.push(&chat_frame(json!({ "reasoning_content": "thought" })));
+        let final_frames = stream.finish();
+        let output = rendered([first, second, final_frames].concat());
+
+        assert!(output.contains("\"id\":\"rs_original\""), "{output}");
+        assert!(output.contains("\"encrypted_content\":\"enc\""), "{output}");
+    }
+
+    #[test]
+    fn streamed_late_id_does_not_attach_cipher_to_generated_id() {
+        let mut stream = ResponsesStream::new("m", &json!({}));
+        let first = stream.push(&chat_frame(json!({ "reasoning_content": "thought" })));
+        let second = stream.push(&chat_frame(json!({
+            (FIELD_REASONING_ITEM_ID): "rs_original",
+            (FIELD_ENCRYPTED_CONTENT): "enc",
+        })));
+        let final_frames = stream.finish();
+        let output = rendered([first, second, final_frames].concat());
+
+        assert!(!output.contains("\"encrypted_content\":\"enc\""), "{output}");
+    }
+
+    #[test]
+    fn nonstream_encrypted_content_without_id_is_dropped() {
+        let mut collector = ResponsesCollector::new();
+        collector.push(&chat_frame(json!({ (FIELD_ENCRYPTED_CONTENT): "enc" })));
+        collector.finish();
+        let response = collector.into_response("m", &json!({}));
+
+        assert!(response["output"].as_array().unwrap().iter().all(|item| {
+            item["type"] != "reasoning" || item.get("encrypted_content").is_none()
+        }));
     }
 }

@@ -1303,13 +1303,14 @@ mod tests {
             "model": "m",
             "messages": [
                 { "role": "assistant", "content": "answer",
-                  "reasoning_content": "thought", "_wb_encrypted_content": "enc" },
+                  "reasoning_content": "thought", "_wb_reasoning_item_id": "rs_original",
+                  "_wb_encrypted_content": "enc" },
             ],
         });
         let body = responses_request_from_chat(&chat, "m").unwrap();
         let item = &body["input"][0];
         assert_eq!(item["type"], "reasoning");
-        assert!(item.get("id").is_some(), "带加密体时应保留 id 形态: {item}");
+        assert_eq!(item["id"], "rs_original");
         assert_eq!(item["encrypted_content"], "enc");
     }
 }

@@ -219,12 +219,14 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
         items.push(item);
     }
     // 正文：Responses 不需要空的 assistant message（只带工具调用的轮次
-    // 只发 function_call 项）；空正文跳过也能避免上游把空消息判成错误
+    // 只发 function_call 项）；空正文跳过也能避免上游把空消息判成错误。
+    // 这里是从 Chat 历史重建的 input 项，不是上游已持久化的 output 项，不能
+    // 生成 `id`：部分 Responses 上游会把带 id 的 input 项当成 persisted-item
+    // 引用并尝试查找，导致整轮请求被拒绝。input 项的 id 是可选的。
     let text = content_text(message.get("content").unwrap_or(&Value::Null));
     if !text.is_empty() {
         items.push(json!({
             "type": "message",
-            "id": random_id("msg"),
             "role": "assistant",
             "content": [{ "type": "output_text", "text": text }],
         }));
@@ -251,9 +253,10 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
                     raw
                 }
             };
+            // `call_id` 是工具输出配对键，不是 input item 的持久化 `id`。
+            // 无状态重建时保留前者，省略后者。
             items.push(json!({
                 "type": "function_call",
-                "id": random_id("fc"),
                 "call_id": call_id,
                 "name": name,
                 "arguments": arguments,
@@ -884,4 +887,36 @@ fn chat_usage_from_responses(usage: &Value) -> Value {
         Value::from(json_number_of(usage, &["total_tokens"]).max(input + output)),
     );
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::responses_request_from_chat;
+    use serde_json::json;
+
+    #[test]
+    fn rebuilt_assistant_input_items_omit_ids_and_preserve_tool_pairing() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": "answer" },
+                { "role": "assistant", "content": null, "tool_calls": [
+                    { "id": "call_original", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                ] },
+                { "role": "tool", "tool_call_id": "call_original", "content": "done" },
+            ],
+        });
+
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], "message");
+        assert!(items[0].get("id").is_none(), "{items:?}");
+        assert_eq!(items[1]["type"], "function_call");
+        assert!(items[1].get("id").is_none(), "{items:?}");
+        assert_eq!(items[1]["call_id"], "call_original");
+        assert_eq!(items[2]["type"], "function_call_output");
+        assert_eq!(items[2]["call_id"], "call_original");
+    }
 }

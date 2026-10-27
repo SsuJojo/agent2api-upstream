@@ -641,12 +641,10 @@ fn push_input_item(
                 return Ok(());
             };
             let content = content_to_chat(content, &role);
-            // assistant 的空消息要丢掉：上游对「空 assistant」的处理各家不一，
-            // 而 Responses 的 reasoning-only 项会退化成空消息
-            if role == "assistant"
-                && content_text(&content).is_empty()
-                && !content_is_structured(&content)
-            {
+            // 空消息要丢掉：上游对「空消息」的处理各家不一
+            //   - assistant：Responses 的 reasoning-only 项会退化成空消息；
+            //   - user：Codex 多 agent 的 `agent_message` 只有加密载荷，过滤后什么都不剩。
+            if content_text(&content).is_empty() && !content_is_structured(&content) {
                 return Ok(());
             }
             let mut message = Map::new();
@@ -896,6 +894,10 @@ fn content_to_chat(content: &Value, role: &str) -> Value {
                 let url = image_url_of(part);
                 out.push(json!({ "type": "image_url", "image_url": { "url": url } }));
             }
+            // Codex 多 agent 的不透明载荷只有 Codex 自己解得开，不是对话内容；
+            // Chat 上游不支持该块，原样透传会导致请求被拒。reasoning 项顶层的
+            // continuity encrypted_content 由另一条路径保留，不受这里影响。
+            "encrypted_content" => {}
             // 文件/音频/视频：Chat 侧没有统一表达，转成文本占位会让模型看到
             // 一段无意义的 JSON —— 这里保留原始块，由上游自己决定认不认
             _ => {
@@ -903,6 +905,10 @@ fn content_to_chat(content: &Value, role: &str) -> Value {
                 out.push(part.clone());
             }
         }
+    }
+    // 只剩加密块时返回空串，随后由 push_input_item 丢弃整条空消息。
+    if out.is_empty() {
+        return Value::String(String::new());
     }
     // 只有一个文本块时降级成字符串（与上面同理由）
     if only_text && out.len() == 1 {
@@ -2347,6 +2353,65 @@ mod continuity_tests {
 
         assert!(response["output"].as_array().unwrap().iter().all(|item| {
             item["type"] != "reasoning" || item.get("encrypted_content").is_none()
-        }));
+}
+
+#[cfg(test)]
+mod agent_message_tests {
+    use super::*;
+
+    fn agent_message(cipher: &str) -> Value {
+        json!({
+            "type": "agent_message",
+            "id": "amsg_01a178e8-a0b7-76e0-a4cf-dddcda331108",
+            "author": "/root/code",
+            "recipient": "/root",
+            "content": [
+                { "type": "input_text", "text": "Message Type: MESSAGE\\nTask name: /root" },
+                { "type": "encrypted_content", "encrypted_content": cipher }
+            ]
+        })
+    }
+
+    #[test]
+    fn agent_message_drops_cipher_and_keeps_text() {
+        let body = json!({"model":"m", "input":[agent_message("gAAAAABq")]});
+        let chat = chat_from_responses(&body).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0]["role"], "user");
+        assert!(messages[0]["content"].as_str().unwrap().contains("Message Type: MESSAGE"));
+        assert!(!messages[0].to_string().contains("gAAAA"));
+    }
+
+    #[test]
+    fn cipher_only_message_is_dropped() {
+        let body = json!({
+            "model":"m",
+            "input":[
+                {"role":"user", "content":"prior"},
+                {"type":"agent_message", "content":[{"type":"encrypted_content", "encrypted_content":"gAAAAABq"}]}
+            ]
+        });
+        let chat = chat_from_responses(&body).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0]["content"], "prior");
+    }
+
+    #[test]
+    fn encrypted_part_does_not_break_multimodal_content() {
+        let body = json!({
+            "model":"m",
+            "input":[{"role":"user", "content":[
+                {"type":"input_text", "text":"look"},
+                {"type":"encrypted_content", "encrypted_content":"gAAAAABq"},
+                {"type":"input_image", "image_url":"data:image/png;base64,AAA"}
+            ]}]
+        });
+        let chat = chat_from_responses(&body).unwrap();
+        let content = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{content:?}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
     }
 }

@@ -41,6 +41,10 @@ export type ManageModel = {
   providerLabel: string
   /** 'remote' / 'builtin' / 'manual'；自定义家留空串（那两列按视图隐藏） */
   source: string
+  kind?: string
+  supports_image_generation?: boolean
+  supports_image_editing?: boolean
+  output_modalities?: string[]
   enabled: boolean
   aliases: string[]
   /** 家级字段：这家清单的最近拉取时刻（毫秒，0 = 未知）；自定义家没有 */
@@ -70,6 +74,19 @@ export type ManageModel = {
   reasoningLevels?: unknown
   /** 默认思考档位（与 `reasoningLevels` 同源；缺失 = 未声明） */
   reasoningDefaultLevel?: unknown
+  /**
+   * **可见性**：这个模型在官方客户端里是否会被列出。
+   *
+   * `'shown'` / `'hidden'` / `'undeclared'`，由各家 `models.rs` 在自己的解析层
+   * 算出（判据各异：Antigravity 按世代、Qoder 读上游 `enable`、Raccoon 读
+   * `visible`、CodeArts 读 `display_enabled`）。
+   *
+   * **缺失 / `null`** = 这家没有可见性判据（当前是除那四家之外的所有家）。
+   * 这与 `'shown'` 是两件事：前者是「这家没这个信息」，后者是「这家说它可见」。
+   * 界面必须把两者分开显示，否则用户会以为「没有判据」是「确认可见」。
+   */
+  visibility?: unknown
+  upstreamStatus?: 'undeployed' | null
 }
 
 /** 一条映射（含表格现造的默认绑定：alias == target） */
@@ -84,10 +101,19 @@ export type ManageMapping = {
   carried?: boolean
 }
 
+export type ManageProvider = {
+  provider: string
+  providerLabel: string
+  count: number
+  source: 'none' | 'remote' | 'builtin'
+  refreshedAt: number
+}
+
 /** 一份同形数据（内置家来自 /api/models/manage，自定义家由 buildView 适配） */
 export type ManageView = {
   models?: ManageModel[]
   mappings?: ManageMapping[]
+  providers?: ManageProvider[]
   /** 候选思考等级（只有内置家那份响应带；缺了走 models-reasoning.ts 的兜底表） */
   reasoningLevels?: string[]
 }
@@ -135,9 +161,11 @@ function shared(): SharedWindow {
 const norm = (value: unknown): string => String(value ?? '').trim().toLowerCase()
 const same = (left: unknown, right: unknown): boolean => norm(left) === norm(right)
 
+export const ALL_CUSTOM = 'custom-all'
+
 /** `custom-` 前缀判据（与后端 `is_custom_provider_id` 一致） */
 export function isCustom(id: unknown): boolean {
-  return typeof id === 'string' && id.startsWith('custom-')
+  return typeof id === 'string' && id !== ALL_CUSTOM && id.startsWith('custom-')
 }
 
 /** 全部自定义提供商（目录缓存的原始记录，按 createdAt 升序） */

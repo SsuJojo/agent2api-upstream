@@ -26,7 +26,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     chat_frame, content_parts, content_text, is_truthy, json_number_of, json_text, native_tool,
-    random_id, string_field, string_value, SseLineBuffer, FIELD_ENCRYPTED_CONTENT, FIELD_IS_ERROR,
+    random_id, string_field, string_value, SseLineBuffer, FIELD_ENCRYPTED_CONTENT,
+    FIELD_IS_ERROR, FIELD_REASONING_ITEM_ID,
 };
 use super::responses::{image_url_of, tool_output_parts, ConvertError, ToolOutput};
 use super::tool_plan;
@@ -208,10 +209,12 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty());
     if !reasoning.is_empty() || encrypted.is_some() {
-        // id 只在**带加密体**时给：没有加密载体的回放（下游 Messages 链路把
-        // thinking 文本折回 summary 的场景）伪造一个 `rs_` id，遇到校验 item id
-        // 的严格上游（官方 Responses store:false）会被按「查无此项」整轮拒绝；
-        // input 项的 id 本就可省，无载体时不发比伪造更稳。
+        // id 只在**带加密体、且确实拿到了上游真实 id**时给：
+        //   - 没有加密载体的回放（下游 Messages 链路把 thinking 文本折回
+        //     summary）本就不该带 id；
+        //   - 有载体但没暂存到 id 时，伪造一个 `rs_` 配上真实加密体，严格上游
+        //     （官方 Responses store:false）按 item id 查项会整轮拒绝 —— 比不带
+        //     id 更糟。input 项的 id 本就可省。
         let mut item = json!({
             "type": "reasoning",
             "summary": if reasoning.is_empty() {
@@ -222,7 +225,13 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
         });
         if let Some(encrypted) = encrypted {
             if let Some(object) = item.as_object_mut() {
-                object.insert("id".to_string(), Value::String(random_id("rs")));
+                let id = message
+                    .get(FIELD_REASONING_ITEM_ID)
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty());
+                if let Some(id) = id {
+                    object.insert("id".to_string(), Value::String(id.to_string()));
+                }
                 object.insert(
                     "encrypted_content".to_string(),
                     Value::String(encrypted.to_string()),
@@ -512,6 +521,8 @@ pub struct ChatFromResponsesStream {
     /// 已宣告的工具：主键 → 槽位（chat 的 tool_calls index +
     /// 是否已发过参数增量）
     tools: BTreeMap<String, ToolSlot>,
+    /// 已转发的 reasoning 连续性字段，按 upstream item id 去重。
+    reasoning_items: BTreeMap<String, ReasoningSlot>,
     /// 同一工具的**别名 → 主键**：官方 Responses 的 added 项同时带
     /// `call_id`（`call_…`）与 `id`（`fc_…`）两个身份，而增量 / 收尾事件
     /// 只带 `item_id`（值 = added 项的 `id`）。不归并别名的话，每个增量
@@ -530,6 +541,13 @@ struct ToolSlot {
     has_arguments: bool,
 }
 
+/// reasoning item 的 id 与 encrypted_content 可能分别出现在 added / done 事件。
+#[derive(Default)]
+struct ReasoningSlot {
+    id_sent: bool,
+    encrypted_sent: bool,
+}
+
 impl ChatFromResponsesStream {
     pub fn new(model: &str) -> Self {
         Self {
@@ -540,6 +558,7 @@ impl ChatFromResponsesStream {
             started: false,
             finished: false,
             tools: BTreeMap::new(),
+            reasoning_items: BTreeMap::new(),
             tool_aliases: BTreeMap::new(),
             next_tool_index: 0,
             usage: None,
@@ -637,6 +656,9 @@ impl ChatFromResponsesStream {
             "response.output_item.added" => {
                 let item = event.get("item").unwrap_or(&Value::Null);
                 let item_kind = string_field(item, "type").to_lowercase();
+                if item_kind == "reasoning" {
+                    return self.reasoning_continuity(event, item);
+                }
                 if !matches!(item_kind.as_str(), "function_call" | "custom_tool_call") {
                     return Vec::new();
                 }
@@ -700,6 +722,9 @@ impl ChatFromResponsesStream {
             "response.output_item.done" => {
                 let item = event.get("item").unwrap_or(&Value::Null);
                 let item_kind = string_field(item, "type").to_lowercase();
+                if item_kind == "reasoning" {
+                    return self.reasoning_continuity(event, item);
+                }
                 let arguments = match item_kind.as_str() {
                     "function_call" => {
                         let raw = json_text(item.get("arguments").unwrap_or(&Value::Null));
@@ -720,8 +745,20 @@ impl ChatFromResponsesStream {
             }
             // 上游错误（事件流里的失败）：折成 chat 错误帧 + [DONE]
             "error" | "response.failed" => self.fail(event),
-            // 终态：收尾（usage 已在开头收过）
-            "response.completed" | "response.done" => self.complete(None),
+            // 终态：收尾（usage 已在开头收过）。部分兼容网关只在最终 response
+            // 里带完整 output，没有逐项 done；这里补扫 reasoning 连续性字段。
+            "response.completed" | "response.done" => {
+                let mut out = Vec::new();
+                if let Some(items) = event.pointer("/response/output").and_then(Value::as_array) {
+                    for item in items {
+                        if string_field(item, "type").eq_ignore_ascii_case("reasoning") {
+                            out.extend(self.reasoning_continuity(event, item));
+                        }
+                    }
+                }
+                out.extend(self.complete(None));
+                out
+            }
             "response.incomplete" => {
                 // incomplete_details.reason 是 Responses 口径（官方值
                 // "max_output_tokens" / "content_filter"），而 chat 的
@@ -741,6 +778,54 @@ impl ChatFromResponsesStream {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// 把上游 reasoning 项的 id / encrypted_content 转成内部 Chat 帧。
+    ///
+    /// 两者可能分别出现在 `response.output_item.added` 与 `.done`，因此按
+    /// item id 记录已转发状态；缺 id 时才退回 output_index 作为键。
+    fn reasoning_continuity(&mut self, event: &Value, item: &Value) -> Vec<bytes::Bytes> {
+        let id = string_field(item, "id");
+        let encrypted = string_field(item, "encrypted_content");
+        if id.is_empty() && encrypted.is_empty() {
+            return Vec::new();
+        }
+        let key = if !id.is_empty() {
+            id.clone()
+        } else {
+            format!(
+                "output_index:{}",
+                event.get("output_index").map(string_value).unwrap_or_default()
+            )
+        };
+        let (send_id, send_encrypted) = {
+            let slot = self.reasoning_items.entry(key).or_default();
+            let send_id = !id.is_empty() && !slot.id_sent;
+            let send_encrypted = !encrypted.is_empty() && !slot.encrypted_sent;
+            if send_id {
+                slot.id_sent = true;
+            }
+            if send_encrypted {
+                slot.encrypted_sent = true;
+            }
+            (send_id, send_encrypted)
+        };
+        if !send_id && !send_encrypted {
+            return Vec::new();
+        }
+        let mut delta = Map::new();
+        if send_id {
+            delta.insert(FIELD_REASONING_ITEM_ID.to_string(), Value::String(id));
+        }
+        if send_encrypted {
+            delta.insert(
+                FIELD_ENCRYPTED_CONTENT.to_string(),
+                Value::String(encrypted),
+            );
+        }
+        let mut out = self.start();
+        out.push(self.delta_frame(Value::Object(delta)));
+        out
     }
 
     /// 首帧（role assistant）：与官方 bridge 同款 —— 空响应或只有工具的流
@@ -768,7 +853,9 @@ impl ChatFromResponsesStream {
         if let Some(primary) = self.resolve_tool_key(event, item) {
             for key in tool_identity_keys(event, item) {
                 if key != primary && !self.tools.contains_key(&key) {
-                    self.tool_aliases.insert(key, primary.clone());
+                    // 已登记到别的主键的别名不覆盖：宁可这个事件落到旧槽，也不能
+                    // 把两条工具的身份链悄悄接在一起。
+                    self.tool_aliases.entry(key).or_insert_with(|| primary.clone());
                 }
             }
             return primary;
@@ -781,7 +868,9 @@ impl ChatFromResponsesStream {
         self.next_tool_index += 1;
         self.tools.insert(primary.clone(), ToolSlot { index, has_arguments: false });
         for key in keys.iter().skip(1) {
-            self.tool_aliases.insert(key.clone(), primary.clone());
+            self.tool_aliases
+                .entry(key.clone())
+                .or_insert_with(|| primary.clone());
         }
         let call_id = {
             let raw = string_field(item, "call_id");
@@ -949,9 +1038,15 @@ fn tool_identity_keys(event: &Value, item: &Value) -> Vec<String> {
             keys.push(text);
         }
     }
-    let output_index = event.get("output_index").map(string_value).unwrap_or_default();
-    if !output_index.is_empty() && !keys.contains(&output_index) {
-        keys.push(output_index);
+    // `output_index` 是**位置**不是身份：只在事件一个强身份都没带时才兜底，且用
+    // `idx:` 前缀与真 id 分属不同命名空间。把它无条件并进同一组键会让「同一
+    // output_index 上的另一个工具」被并进已有槽位（兼容网关常见：每次宣告都
+    // 从 0 开始编号，但 call_id / id 是新的）。
+    if keys.is_empty() {
+        let output_index = event.get("output_index").map(string_value).unwrap_or_default();
+        if !output_index.is_empty() {
+            keys.push(format!("idx:{output_index}"));
+        }
     }
     keys
 }
@@ -1208,13 +1303,14 @@ mod tests {
             "model": "m",
             "messages": [
                 { "role": "assistant", "content": "answer",
-                  "reasoning_content": "thought", "_wb_encrypted_content": "enc" },
+                  "reasoning_content": "thought", "_wb_reasoning_item_id": "rs_original",
+                  "_wb_encrypted_content": "enc" },
             ],
         });
         let body = responses_request_from_chat(&chat, "m").unwrap();
         let item = &body["input"][0];
         assert_eq!(item["type"], "reasoning");
-        assert!(item.get("id").is_some(), "带加密体时应保留 id 形态: {item}");
+        assert_eq!(item["id"], "rs_original");
         assert_eq!(item["encrypted_content"], "enc");
     }
 }

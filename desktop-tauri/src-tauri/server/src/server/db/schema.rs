@@ -80,7 +80,16 @@ use rusqlite::Connection;
 /// 「功能已删、数据留着」的键，登记它们的唯一目的就是让配置写入别去动它。
 pub const RESERVED_KV_KEYS: &[&str] = &[
     // 账号优先级的全局作用域（core::account_store::sql）
+    // 「Agent」页的用户配置：{ clientId: [Profile] } 整份 JSON 一个键
+    // （core::agents）。零散状态，与 desktopSettings 同一类。
+    "agentProfiles",
     "priorityScope",
+    // 侧边栏布局（core::sidebar_layout）：整份「分组 / 顺序 / 显隐」JSON 一个键。
+    // 从前只存浏览器 localStorage，而桌面壳与网页端是两个 origin、localStorage
+    // 隔离 —— 于是「在 WebUI 里隐藏的菜单，客户端照旧显示」。落库后两端读同一份。
+    // 属于「其它零散状态」：配置写入绝不能动它（否则用户改一次 API Key
+    // 侧边栏就退回默认布局）。
+    "sidebarLayout",
     // 事件日志的下一个 id 水位（logs_store::sql）
     "logsNextId",
     // 整份桌面设置 JSON（壳侧 settings）—— 一个键而不是拆成三个：
@@ -167,12 +176,6 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 页「订阅管理」维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
     // 清单。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能动它。
     "subscriptions",
-    // OfficeAce 模型可用性探测的结论（core::providers::officeace::probe）：
-    // 整份 `{unavailable:[…], probedAt, account}` 一个键。探测「目录里列着、这个
-    // 号实际打不通」的模型（上游回 81004/81009），结论由 `advertise_models` 用来
-    // 默认隐藏它们。属于「其它零散状态」——不是配置项，配置写入绝不能动它
-    // （否则每次改配置都让隐藏集合清零、客户端又照着一个一个试）。
-    "officeaceModelProbe",
     // models.dev 模型元数据的刷新结果（core::model_meta::snapshot）：整份
     // 「上次成功拉到的精简索引」一个键（文件形态与内嵌快照逐字相同，生成口径见
     // `scripts/sync-modelsdev.mjs`）。**不是**配置项 —— 配置写入绝不能动它，
@@ -180,6 +183,16 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
     // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
     "modelsDevCatalog",
+    // 云同步的配置与同步状态（core::cloud_sync）：整份
+    // `{provider, webdav:{…}, s3:{…}, syncPassword(信封), enabled, autoSync,
+    //   remoteRoot, profile, status:{lastSyncAt, lastSnapshotId, …}}` 一个键。
+    //
+    // 为什么是保留键而不是配置项：它含**远端凭据**（WebDAV 密码 / S3 Secret
+    // Access Key 的密文信封）与同步密码信封，属于「其它零散状态」一类；
+    // 更关键的是**它自己不能被云同步上传** —— 否则等于把远端凭据再传到远端，
+    // 换机时还会被旧凭据覆盖。保留键的身份让 `cloud_sync::snapshot` 的键筛选
+    // 天然排除它，不必再维护一份「别同步这个键」的清单。
+    "cloudSync",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -308,9 +321,15 @@ pub fn is_reserved(key: &str) -> bool {
 /// 两条都是 `CREATE INDEX IF NOT EXISTS`（与其余版本的幂等纪律一致）：在存量库
 /// 上建索引要扫一遍表，代价与表大小成正比、只付一次；`requests` 只有几万行时
 /// 在百毫秒量级，不会让启动明显变慢。**不要把这两条往 [`V1_SCHEMA`] 里补**：
-/// 新库按 1→15 依次跑，v15 那一步同样会建出来，而 v1 里多写一份等于同一条索引
+/// 新库按 1→16 依次跑，v15 那一步同样会建出来，而 v1 里多写一份等于同一条索引
 /// 有了两处定义 —— 将来改一处忘一处，正是 `V4_SCHEMA` 那类错位的来源。
-pub const SCHEMA_VERSION: i64 = 15;
+///
+/// ── v16：AI 助手的对话会话（[`V16_SCHEMA`]）──────────────────
+/// 助手从「一次性对话」变成「有历史记录的会话」：左边一列会话、右边一条消息流，
+/// 关掉页面再回来还能接着聊。存**整条消息流的 JSON**（而不是逐条消息一行）的
+/// 理由与 `kv` 表同一取向：读写单元天然是「一整个会话」，逐条存只会让每次保存
+/// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查」。
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -463,16 +482,8 @@ CREATE TABLE IF NOT EXISTS request_daily (
 -- 而头部哪怕没有也应该是 `'{}'`（前端按对象读）。
 -- 为什么体用 TEXT 而不用 BLOB：里面是 SSE 文本 / JSON 文本，存 TEXT 才能在
 -- `sqlite3` 命令行里直接看（排障场景这是主要用法）。
--- truncated 标记「体被单条上限截断过」（见 debug_traffic::MAX_ENTRY_BYTES），
--- 缺了它前端会把半截响应当完整响应展示。
--- size 是该条**落库后实际占用的字节数**（截断后的三份 JSON 文本 + 两份可空
--- 文本 + 身份字段的长度合计，见 `debug_traffic::sql::payload_bytes`），供两道闸
--- 的字节统计用（`SUM(size)` 与 MAX_TOTAL_BYTES 比较）。
--- 它**不是**「未截断前的原始大小」：闸门守的是「这张表实际占多大」，用截断后的
--- 体积才对得上。这一行原先按「将来可能存原始大小」的设想写成「未截断前」，与
--- 实现不符 —— 改造前的 entry_size 也是截断后体积（原版 record 先 truncate 再算
--- size），所以现在的口径是承接既有实现、不是本次改造新定的。将来真需要原始
--- 大小就**另加一列**（在截断前记一笔），不要复用 size。
+-- truncated 保留历史报文的截断标记；新采集的正文不截断。
+-- size 是完整报文落库后的文本字节合计，不含 SQLite 页与行开销。
 -- 索引只有 ts：调试报文按时间倒序翻页是唯一的批量读法，其余都按主键 id 取。
 CREATE TABLE IF NOT EXISTS debug_traffic (
   id               TEXT PRIMARY KEY,
@@ -543,21 +554,17 @@ ALTER TABLE requests ADD COLUMN sensitive_hits TEXT NOT NULL DEFAULT '[]';
 /// 版本 3：`request_raw` 表 —— 请求/响应的**下游侧**原始正文（预览对话功能的地基）。
 ///
 /// ── 它和 debug_traffic 表是什么关系 ──────────────────────────
-/// `debug_traffic`（调试报文）是调试模式的**上游侧**报文（头部脱敏、
-/// 有全局字节闸）；本表是**下游侧**正文（客户端发来的请求体 + 网关下发的
-/// 响应体），供请求日志的「预览对话」弹窗用。两表按同一个 `id`（请求关联 id）
-/// 各存各的，谁也不依赖谁。
+/// `debug_traffic` 保存头部脱敏后的完整上游报文；本表保存完整下游正文，
+/// 供请求日志的「预览对话」使用。两表按同一个请求 id 关联，独立读写。
 ///
 /// ── 采集条件：与调试模式同一个开关（v13 起）───────────────────
 /// 正文**只在调试模式开启时采集**（对齐 OmniProxy 的口径：不开调试模式就不
-/// 保存任何原始正文）—— 关着时连截断转换都不做，采集路径零开销。v13 之前的
+/// 保存任何原始正文）—— 关着时不复制正文，采集路径零开销。v13 之前的
 /// 版本是无条件采集的，那批历史正文已由 v13 一次清空（见 [`SCHEMA_VERSION`]）。
 ///
 /// ── 为什么独立成表而不是给 requests 加两列 ────────────────────
-/// 正文是大字段（两侧各 128 KiB 上限），明细列表的每次分页都要取
-/// `REQUEST_COLUMNS` —— 混进主表会让「只看列表」的请求反复搬运几百 KB 的
-/// TEXT。独立表后主查询零开销，按 id 取详情时才 join 进来；请求日志列表页
-/// 也不需要改任何 SQL（OmniProxy 的 request_log_raw 副表同此取舍）。
+/// 正文是完整大字段，不能混入明细列表的每次分页查询。
+/// 独立表后只在用户查看详情时读取正文。
 ///
 /// ── 为什么 id 直接当主键 ────────────────────────────────────
 /// 一条请求只有一份「下游视角」的正文，天然一对一（与 requests 表的 id
@@ -814,6 +821,60 @@ CREATE INDEX IF NOT EXISTS idx_requests_summary ON requests(
 );
 ";
 
+/// 版本 16：AI 助手的对话会话表（schema v16）。
+///
+/// ── 存什么 ──────────────────────────────────────────────────
+/// 一条会话一行。列的口径：
+///   - `id`：会话 id（前端生成，`crypto.randomUUID()` 形态的字符串）。让前端
+///     生成而不是自增：新建会话时前端立刻要用这个 id 挂消息，等一次往返再拿到
+///     它会让「点新建 → 立刻发第一句」出现一个必须等待的中间态；
+///   - `title`：侧边栏显示的名字。取第一条用户消息的前若干字（前端算好传上来），
+///     用户没改过就一直是它 —— 后端不做「自动起标题」那种额外一次上游调用；
+///   - `messages`：**整条消息流的 JSON 原文**（`[{role, content, toolCalls?,
+///     toolCallId?}, …]`，与发给上游的 wire 形态同构）。存原文而不是拆列的理由
+///     见 [`SCHEMA_VERSION`] 的 v16 段；
+///   - `model` / `reasoning`：这条会话最后用的模型与思考等级。存**会话级**而不是
+///     每条消息各带一份：用户换模型是「这条对话从现在起换个模型」，不是逐条
+///     指定；重开一条会话时前端从这两个字段恢复选择器；
+///   - `created_at` / `updated_at`：毫秒时间戳。侧边栏按 `updated_at` 倒序排
+///     （最近聊过的在最上面），`updated_at` 每次保存都刷新。
+///
+/// ── 索引 ────────────────────────────────────────────────────
+/// 只有一条 `updated_at` 倒序索引：侧边栏的全部查询就是「按最近更新排序列出」，
+/// 没有按标题 / 模型检索的需求（会话量级是几十条，前端一次全取即可）。
+const V16_SCHEMA: &str = "
+-- ── assistant_sessions：AI 助手的对话会话（schema v16）───────
+CREATE TABLE IF NOT EXISTS assistant_sessions (
+  id          TEXT PRIMARY KEY,
+  title       TEXT NOT NULL DEFAULT '',
+  messages    TEXT NOT NULL DEFAULT '[]',
+  model       TEXT,
+  reasoning   TEXT,
+  created_at  INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_sessions_updated ON assistant_sessions(updated_at DESC);
+";
+
+const V17_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS account_limiter_events (
+  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  account_id TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT '',
+  ts INTEGER NOT NULL,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_limiter_events_account_time ON account_limiter_events(account_id, ts, channel);
+INSERT OR IGNORE INTO account_limiter_events (id, account_id, model, ts, tokens, requests)
+SELECT 'legacy:' || row_id, account_id,
+       CASE WHEN upstream_model != '' THEN upstream_model ELSE model END,
+       ts, MAX(total_tokens, 0), 1
+FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// **库版本高于本程序时返回 `Err` 拒绝打开**（v14 起有意反转的一条既有决定，
@@ -901,7 +962,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // 失败**不报错**：数据已经删掉了，回收空间是尽力而为的优化 —— 用户
         // 之后仍可在请求日志页的「清理」弹窗里手动压缩（那条路有后台线程与
         // 进度状态，见 `RequestStats::compact`）。
+        //
+        // VACUUM 前后各做一次 checkpoint（与 `RequestStats::compact` 同形，理由
+        // 见那边模块注释）：WAL 模式下 VACUUM 的整库重建会全部落进 `-wal`，
+        // 少了尾部那次截零，空间只是从主库搬到 WAL、总占用不降反升（issue #297）。
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let _ = conn.execute_batch("VACUUM;");
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
     Ok(())
 }
@@ -971,6 +1038,13 @@ fn apply_version(
         // v15：requests 补两条索引（status 的定位 + 报表窄列的覆盖，见
         // V15_SCHEMA 与 SCHEMA_VERSION 的 v15 段）。
         15 => conn.execute_batch(V15_SCHEMA),
+        // v16：assistant_sessions 助手对话会话表（见 V16_SCHEMA 与
+        // SCHEMA_VERSION 的 v16 段）。新表用 CREATE IF NOT EXISTS，幂等。
+        16 => conn.execute_batch(V16_SCHEMA),
+        17 => conn.execute_batch(V17_SCHEMA),
+        18 => conn.execute_batch(include_str!("schema_source_stats.sql")),
+        19 => conn.execute_batch(include_str!("schema_assistant_images.sql")),
+        20 => conn.execute_batch(include_str!("schema_debug_raw.sql")),
         _ => Ok(()),
     }
 }

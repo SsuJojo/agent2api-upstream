@@ -18,10 +18,13 @@
  */
 
 import type * as React from 'react'
+import type { UpdateChannels } from '../../../ui-shared/updates'
+export type { UpdateChannels } from '../../../ui-shared/updates'
 // 代理池的共享类型与值前缀与账号页共用一份 —— 两处下拉的值域必须一致
 // （`pool:<id>`），各写一份迟早会漂移。accounts-shared 是纯类型 + 常量的
 // 自包含模块（不 import 任何业务模块），这里引用它不产生循环。
-import { POOL_VALUE_PREFIX, poolItemLabel, type PoolItem } from './accounts-shared'
+import { POOL_VALUE_PREFIX, isPortlessSubscription, poolItemLabel, type PoolItem } from './accounts-shared'
+import { acceptProxyPool } from './proxy-pool-cache'
 import { t } from '../i18n'
 
 /* ─── 类型 ─────────────────────────────────── */
@@ -42,14 +45,29 @@ export type UpdateInfo = {
   prerelease?: boolean
   /** 可下载资产；没有资产时「下载并安装」不给 */
   asset?: { url?: string; name?: string } | null
-  /** owner/repo：作者主页与仓库地址由它现拼，代码里不写死账号 */
+  /** 安装包所在的仓库（构建账号下），只描述「更新从哪来」；
+   *  **不要**拿它拼作者主页 / Star 链接 —— 那是 `sourceRepository` 的事 */
   repository?: string
+  /** 项目源码仓库（`owner/repo`）：作者主页与「收藏项目」由它现拼。
+   *  与 `repository` 分开是因为安装包放在借来的构建账号下，那个账号的主页
+   *  没有代码、没有 issue，指过去等于指错地方 */
+  sourceRepository?: string
   /** 'nsis'（Windows，要 UAC 提权）/ 'dmg'（macOS，挂载后手动拖） */
   installerKind?: string
   /** 检查时刻（后端给的；前端不用本地时钟冒充） */
   checkedAt?: number
+  /** 后端记录的最近一次检查失败原因（成功时为空）。桌面壳的 checkUpdate 不带它，
+   *  只有 /api/update/status 有 —— 面板据此判断「缓存里的结果是不是已被一次失败覆盖」 */
+  lastError?: string | null
+  /** 最近一次**尝试**检查的时刻（成功与失败都记）。与 checkedAt（最近一次成功）比较，
+   *  大于它说明之后又失败过一次 */
+  lastAttemptAt?: number
+  /** 后端那一轮检查是否正在执行（在途时不把旧的 lastError 当成「这次失败」） */
+  checking?: boolean
   /** 仅 getUpdateStatus 有：后端定时任务还没查过时为 false */
   checked?: boolean
+  channelChanged?: boolean
+  channels?: UpdateChannels
   /* ── 容器内更新（Linux headless / Docker 专有，桌面端恒为 false/null）──
    * 与上面 asset 是两条路：asset 是桌面安装包（下完由壳跑安装程序），
    * 下面这几个是「在本容器里原地替换程序与界面」的形态。 */
@@ -101,6 +119,12 @@ export type UpdateTokenStatus = {
   saved?: boolean
 }
 
+export type GithubAccessSettings = {
+  mode: 'auto' | 'official' | 'accelerated'
+  mirrorUrl: string
+  saved?: boolean
+}
+
 /** 「软件更新」这一族用到的壳侧接口（见 bridge.rs 的「软件更新」一节） */
 export type UpdateBridge = {
   /** 壳命令：当前版本号只有壳知道，由壳带上去交给后端比较 */
@@ -114,7 +138,10 @@ export type UpdateBridge = {
   setUpdateProxy(payload: { proxy: unknown }): Promise<{
     proxy?: UpdateProxyChoice
     saved?: boolean
+    listener?: 'none' | 'opening'
   } | null | undefined>
+  getGithubAccess(): Promise<GithubAccessSettings | null | undefined>
+  setGithubAccess(payload: Partial<Pick<GithubAccessSettings, 'mode' | 'mirrorUrl'>>): Promise<GithubAccessSettings | null | undefined>
   /** GitHub 令牌状态（filled / origin，永不回显本体） */
   getUpdateToken(): Promise<UpdateTokenStatus | null | undefined>
   /** 保存 / 清除 GitHub 令牌（token 传 null = 清除） */
@@ -127,6 +154,8 @@ export type UpdateBridge = {
     enabled?: boolean
     saved?: boolean
   } | null | undefined>
+  getUpdateChannels(): Promise<UpdateChannels | null | undefined>
+  setUpdateChannels(payload: Partial<Pick<UpdateChannels, 'stable' | 'beta'>>): Promise<UpdateChannels | null | undefined>
   /** 间隔型任务清单：「自动检查更新」（任务 id 'updateCheck'）的开关与间隔读它 ——
    *  那条任务的配置入口收进了「更新设置」弹窗（update-settings.tsx） */
   getScheduledTasks?: () => Promise<{
@@ -136,9 +165,9 @@ export type UpdateBridge = {
   saveScheduledTask?: (
     id: string,
     patch: Record<string, unknown>,
-  ) => Promise<{ id?: string; enabled?: boolean; interval?: number } | null | undefined>
+  ) => Promise<{ id?: string; enabled?: boolean; interval?: number; saved?: boolean } | null | undefined>
   /** 「网络代理」页的池条目（出网代理下拉的选项只来自它，与账号页同一条链） */
-  getProxyPool(): Promise<{ items?: PoolItem[] } | null | undefined>
+  getProxyPool(): Promise<{ items?: PoolItem[]; kernelInstalled?: boolean } | null | undefined>
   downloadUpdate(payload: { url: string; name?: string }): Promise<DownloadTask | null | undefined>
   updateProgress(): Promise<DownloadTask | null | undefined>
   cancelUpdate(): Promise<{ canceled?: boolean } | null | undefined>
@@ -190,6 +219,8 @@ export type SharedWindow = {
   wbSettingsPanel?: { showCategory?: (category: string) => void }
   /** 更新日志的 Markdown 渲染（保持调用，不在这里重写它） */
   wbMarkdown?: { render?: (text: string) => string }
+  /** 内联 SVG 图标集（ui/icons.js 注入；交流群弹窗的品牌标从这里取） */
+  wbIcons?: { icon?: (name: string, size?: number) => string }
 }
 
 export function shared(): SharedWindow {
@@ -231,31 +262,31 @@ export async function openExternal(url: string): Promise<void> {
 }
 
 /**
- * 官方 QQ 群号。两处用：面板页脚那颗「加入 QQ 群」的悬停提示，以及加群弹窗里
- * 显示的「群号」（可复制，给人搜不到码时手打）。
+ * 官方 QQ 群号（三个群）。加群弹窗里逐个显示并可复制；群 1、群 2 都已接近满员，
+ * 加群时优先给群 3 —— 这条提示写在弹窗里，不在常量上。
+ *
+ * 为什么不摆二维码：二维码是打进包里的静态图，换群 / 换码就得跟着发一次版。
+ * 现在群号会变（群 1 满员、后续可能再开群），只留群号 + 复制按钮，改一个常量即可。
+ *
+ * 顺带记一笔：桌面版 QQ 能接的两条加群路子都坏在 QQ 自己那一层 —— `mqqapi://`
+ * 的群名片 QQ NT 不认，`qm.qq.com/q/…` 那条分享链接只认 QQ 内置浏览器。所以
+ * 这里只给群号（手打 / 复制到 QQ 搜索），不假装能一键跳转。
  */
-export const QQ_GROUP = '1127656296'
+export const QQ_GROUPS = [
+  { no: '1127656296', nearlyFull: true },
+  { no: '1130894674', nearlyFull: true },
+  { no: '1108276647', nearlyFull: false },
+] as const
 
 /**
- * 加群二维码：**随界面一起打包**的一张小图（`ui/assets/qq-group/<群号>.jpg`，
- * 与 provider 图标同在 `ui/assets/` 下，同样按相对路径引用）。
- *
- * ── 为什么落在这里，而不是外链 ──────────────────────────────
- * 先后试过两条远程路子，都不成立：
- *   · `mqqapi://card/show_pslcard?…&card_type=group`（社区里流传最广的「一键加群」）：
- *     协议确实注册了、能拉起 QQ 主程序，但桌面版 QQ NT 9.9.36 打开那张群名片后自己
- *     弹「当前QQ暂不支持该内容」；这个拒绝**发生在 QQ 里面**，壳只看得到 ShellExecuteW
- *     成功，判断不了、也就接不了「失败再换一条路」的兜底。
- *   · 群里「分享 → 复制加群链接」给出的 `https://qm.qq.com/q/xxxx`：它是给 QQ 内置
- *     浏览器 / 手机 QQ 用的加群页（靠 `qqapi.wk.js` 那套 App 内 SDK 完成加群），
- *     系统浏览器里走不通。
- * 外链托管（GitHub raw、自建 Worker）也都不如内置：图是死的、就那么一张，放进安装包
- * 不用联网、不受网络环境影响，扫码这条路也不依赖对方 QQ 的版本。
- *
- * 代价说清楚：图在包里，**换群 / 换码必须跟着发一次版**（改文件名 + 这一个常量），
- * 不像外链那样能只换服务端。文件名就用群号，两处对得上即可。
+ * 其它社区入口。都是普通 https 链接，交给系统默认浏览器打开（与更新日志里的
+ * GitHub 链接同一条路：`data-external` 委托 + openReleasePage）。
+ * 展示名不放在这里 —— 它要跟着界面语言走，由调用方写 t() 字面量。
  */
-export const QQ_GROUP_QR = `assets/qq-group/${QQ_GROUP}.jpg`
+export const COMMUNITY_LINKS = [
+  { id: 'telegram', url: 'https://t.me/+9gM8YPvgRL02NGRl' },
+  { id: 'discord', url: 'https://discord.gg/z9GzSJMWp' },
+] as const
 
 /** 更新日志正文：渲染交给 wbMarkdown（不重写它），只做缺失兜底 */
 export function markdownHtml(notes: string): string {
@@ -293,8 +324,8 @@ export function handleExternalClick(event: React.MouseEvent<HTMLElement>): void 
 export async function forwardUpdateResult(): Promise<void> {
   try {
     const info = await shared().workbuddyDesktop?.getUpdateStatus?.()
-    // checked === false：后端还没有任何检查结果（本进程没查过），不拿它去动徽标 / 弹窗
-    if (info && info.checked !== false) shared().wbApp?.updateUpdateBadge?.(info)
+    // 通道变更必须清掉旧徽标和读数；首次启动无缓存则保持现有显示。
+    if (info && (info.checked !== false || info.channelChanged)) shared().wbApp?.updateUpdateBadge?.(info)
   } catch (error) {
     console.warn('读取版本检查结果失败:', errorMessage(error))
   }
@@ -316,6 +347,7 @@ export const PROXY_OTHER_CURRENT = '__proxy_other__'
 /** 出网代理一节的全部读数（弹窗的本地状态就是它） */
 export type ProxySelection = {
   proxyChoice: UpdateProxyChoice
+  proxyLoaded?: boolean
   /**
    * 「网络代理」页的代理池条目 —— 下拉的选项**只来自它**。
    * `null` = 还没读到（弹窗刚打开）；读到后是数组（可能是空的）。
@@ -332,6 +364,7 @@ export type ProxySelection = {
 
 export const EMPTY_PROXY_SELECTION: ProxySelection = {
   proxyChoice: null,
+  proxyLoaded: false,
   pool: null,
   poolError: '',
 }
@@ -349,16 +382,21 @@ export async function fetchProxySelection(): Promise<ProxySelection> {
   const selection: ProxySelection = { ...EMPTY_PROXY_SELECTION }
   if (!api?.getUpdateProxy) return selection
   try {
-    selection.proxyChoice = (await api.getUpdateProxy())?.proxy ?? null
+    const data = await api.getUpdateProxy()
+    if (!data || !Object.prototype.hasOwnProperty.call(data, 'proxy')) throw new Error('更新线路响应异常')
+    selection.proxyChoice = data.proxy ?? null
+    selection.proxyLoaded = true
   } catch {
     /* 设置读不到：按直连显示，保存动作会把真实值带回来 */
   }
   try {
     if (typeof api.getProxyPool !== 'function') throw new Error('桥未提供代理池方法')
-    const items = (await api.getProxyPool())?.items
+    const data = await api.getProxyPool()
+    const items = data?.items
     // 桥异常时可能 resolve 出 undefined 而不是 reject：不校验会伪装成「池里一条都没有」
     if (!Array.isArray(items)) throw new Error('代理池响应异常')
     selection.pool = items
+    acceptProxyPool(items, data?.kernelInstalled)
   } catch (error) {
     selection.pool = []
     selection.poolError = errorMessage(error)
@@ -376,7 +414,7 @@ export async function fetchProxySelection(): Promise<ProxySelection> {
  *
  * 失败在内部 toast 并返回 null（下拉是受控的，界面自动回原值）。
  */
-export async function saveProxy(value: string): Promise<{ choice: UpdateProxyChoice; saved: boolean } | null> {
+export async function saveProxy(value: string): Promise<{ choice: UpdateProxyChoice; saved: boolean; opening: boolean } | null> {
   if (value === PROXY_OTHER_CURRENT) return null
   const api = shared().workbuddyDesktop
   if (!api?.setUpdateProxy) return null
@@ -388,11 +426,13 @@ export async function saveProxy(value: string): Promise<{ choice: UpdateProxyCho
     // 以后端回报的描述形态为准（含解析失败时的 error），不从本地猜
     const choice = result?.proxy ?? null
     const saved = result?.saved !== false
+    const opening = result?.listener === 'opening'
     if (!saved) toast(t('出网线路已切换，但写入磁盘失败（重启后会恢复原线路）'), 'err')
+    else if (opening) toast(t('更新出网线路已保存，正在准备监听端口'))
     else toast(choice
       ? t('✅ 更新出网已切换为 {label}', { label: choice.label || t('指定代理') })
       : t('✅ 更新出网已切换为直连'))
-    return { choice, saved }
+    return { choice, saved, opening }
   } catch (error) {
     toast(t('保存失败：{error}', { error: errorMessage(error) }), 'err')
     return null
@@ -408,7 +448,7 @@ export async function saveProxy(value: string): Promise<{ choice: UpdateProxyCho
  * 「当前值不在池里」（存量里直接引用 Clash 出口或自定义形状的记录）补一条
  * 占位项（label 是后端解析出来的），别让已存的值在下拉里凭空消失。
  */
-export function buildProxyPick(selection: ProxySelection): {
+export function buildProxyPick(selection: ProxySelection, opening = false): {
   current: string
   items: Array<{ value: string; label: string; disabled?: boolean }>
   selected: { value: string; label: string } | undefined
@@ -418,8 +458,13 @@ export function buildProxyPick(selection: ProxySelection): {
   const proxy = selection.proxyChoice
   const source = proxy?.config?.source || proxy?.source
   const label = proxy?.label || (source === 'custom' ? t('自定义代理') : t('已设置'))
-  const broken = Boolean(proxy?.error)
   const poolItems = Array.isArray(selection.pool) ? selection.pool : []
+  const currentItem = source === 'pool'
+    ? poolItems.find(item => item.id === proxy?.config?.proxyId)
+    : undefined
+  const pending = opening && currentItem && currentItem.enabled !== false
+    && !currentItem.orphan && isPortlessSubscription(currentItem)
+  const broken = Boolean(proxy?.error) && !pending
 
   // 当前值映射回下拉的值域：池条目用 `pool:<id>`、其余（Clash 直引 / custom /
   // 坏形状）落到占位项 —— 绝不能回落成「直连」
@@ -429,8 +474,13 @@ export function buildProxyPick(selection: ProxySelection): {
 
   const items: Array<{ value: string; label: string; disabled?: boolean }> = [{ value: '', label: t('直连') }]
   for (const item of poolItems) {
-    // 「名字（协议 主机:端口）」—— 与账号页代理列、账号弹窗的代理表单同一格式
-    items.push({ value: `${POOL_VALUE_PREFIX}${item.id}`, label: poolItemLabel(item) })
+    // 「名字（协议 主机:端口）」—— 与账号页代理列、账号弹窗的代理表单同一格式。
+    // 禁用项置灰：指定的更新出口解析失败时不会回退直连
+    items.push({
+      value: `${POOL_VALUE_PREFIX}${item.id}`,
+      label: poolItemLabel(item),
+      disabled: item.enabled === false,
+    })
   }
   if (selection.pool === null) {
     // 还没读到（弹窗刚打开、请求在途）：给一句「读取中」而不是
@@ -459,8 +509,10 @@ export function buildProxyPick(selection: ProxySelection): {
     items,
     selected: items.find(item => item.value === current),
     broken,
-    title: broken
-      ? t('当前线路不可用：{error}；请重新选择代理或切回直连', { error: String(proxy?.error || '') })
-      : t('检查更新与下载安装包走哪条线路（当前：{current}）；选择即保存。选项来自「网络代理」页；直连失败时会自动借 Clash 混合端口重试一次，选定指定代理后只走它', { current: proxy ? label : t('直连') }),
+    title: pending
+      ? t('更新出网线路已保存，正在准备监听端口')
+      : broken
+        ? t('当前线路不可用：{error}；请重新选择代理或切回直连', { error: String(proxy?.error || '') })
+        : t('检查更新与下载安装包走哪条线路（当前：{current}）；选择即保存。选项来自「网络代理」页；直连失败时会自动借 Clash 混合端口重试一次，选定指定代理后只走它', { current: proxy ? label : t('直连') }),
   }
 }

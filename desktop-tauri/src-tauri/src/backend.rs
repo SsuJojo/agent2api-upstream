@@ -114,7 +114,13 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     // 桌面形态默认只听本机回环：管理 API 不出 127.0.0.1；用户显式开启
     // 「局域网访问」后绑 0.0.0.0，此时免鉴权语义由下面的闸门接管
     // （headless 形态由 agent2api-server 二进制按 AGENT2API_HOST 自行决定）。
-    let mut state = server::ServerState::bootstrap(port, host).map_err(StartupFailure::other)?;
+    // 数据库迁移和历史回填会阻塞，不能占住处理 IPC 与启动等待的异步线程。
+    let mut state = tauri::async_runtime::spawn_blocking(move || {
+        server::ServerState::bootstrap(port, host)
+    })
+    .await
+    .map_err(|error| StartupFailure::other(format!("网关初始化任务失败: {error}")))?
+    .map_err(StartupFailure::other)?;
 
     // 面板访问控制的库句柄注入（桌面不注册管理员 → 该体系不启用，行为不变；
     // 与容器共用数据目录且注册过时，桌面管理 API 需要 Key —— 壳自动携带）
@@ -123,6 +129,13 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     // 管理界面（Tauri 窗口）跑在本机：OAuth 回调可以占本机登记端口，
     // 判据与监听地址解耦 —— 开了局域网访问（0.0.0.0）后依然成立。
     state.local_panel = true;
+
+    // ── 桌面壳标志（Linux 上「挑哪个更新资产」的判据）──────────────
+    // Linux 的桌面壳与容器 / headless 是**同一份编译目标**，而后端的更新检查
+    // 必须知道「本进程有没有 GUI 壳」才能决定：桌面壳挑 deb / AppImage 安装包
+    // 交给壳去装，容器挑服务端包原地替换（见 `update::version::desktop_shell`）。
+    // 不置位时的行为与改造前一致（容器侧不变），所以这里只需壳自己声明。
+    server::core::update::set_desktop_shell(true);
 
     // ── 局域网访问的安全闸门（headless 的同款语义，见 bin/agent2api-server）──
     // 监听一出回环，「一把 Key 都没有 → 全放行」的免鉴权语义不再成立：
@@ -683,6 +696,7 @@ fn cleanup_legacy_resources() {
 /// commands.rs / tray.rs 都无需改动。**幂等**：重复调用时发送端已被 take，
 /// 直接返回 —— 这一点与旧版 `child.take()` 的行为一致。
 pub fn shutdown(state: &AppState) {
+    crate::startup::stop();
     // 定时签到调度：在停服务之前先停它（对照 Node 版 closeAll 里的
     // `autoCheckin.stop(); closeDispatchers();`）。
     //

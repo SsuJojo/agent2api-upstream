@@ -75,6 +75,7 @@ pub async fn chat_completions(
     // axum 对 `Option<Extension<T>>` 有专门实现：取不到就是 `None`，不会像
     // 裸 `Extension<T>` 那样直接拒绝请求（那会把整个免鉴权模式打回 500）。
     key_scope: Option<Extension<crate::server::core::key_scope::KeyScope>>,
+    key_identity: Option<Extension<crate::server::request_stats::ApiKeyIdentity>>,
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
@@ -82,12 +83,12 @@ pub async fn chat_completions(
     let started_at = logging::now_ms();
     // 请求来源客户端（UA 识别，见 `core::client`）：在 headers 被 move 进转发层
     // 之前先判好，早失败路径与收尾记账共用同一个值
-    let client = crate::server::core::client::classify(&pipeline::user_agent_of(&headers));
+    let request_source = pipeline::request_source(&headers, key_identity);
     // ① body 必须是 JSON 对象（数组/标量/null 都算非法）
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(&state, started_at, "", "", &client, &error);
+        record_early_failure(&state, started_at, "", "", &request_source, &error);
         return error.payload_response();
     };
     // ② messages 必须是数组
@@ -99,7 +100,7 @@ pub async fn chat_completions(
         let error = GatewayError::bad_request("缺少 messages 数组");
         let model = model_field_text(&payload);
         let reasoning = pipeline::client_reasoning_of(&payload);
-        record_early_failure(&state, started_at, &model, &reasoning, &client, &error);
+        record_early_failure(&state, started_at, &model, &reasoning, &request_source, &error);
         return error.payload_response();
     }
 
@@ -132,7 +133,7 @@ pub async fn chat_completions(
                 started_at,
                 &model_field_text(&payload),
                 &client_reasoning,
-                &client,
+                &request_source,
                 &error,
             );
             return error.payload_response();
@@ -166,7 +167,7 @@ pub async fn chat_completions(
             &requested_model,
             &client_model,
             &client_reasoning,
-            &client,
+            &request_source,
             // 真实流量：不是模型测试（见 `RecordContext::is_test`）
             false,
         );
@@ -240,6 +241,9 @@ pub async fn chat_completions(
                 Some(context) => context.stream(source),
                 None => source,
             };
+            // 内部暂存字段（`_wb_`）是网关自己的连续性载荷，Responses /
+            // Anthropic 出口会消费；Chat 客户端没有这条链路，不能看到它们。
+            let source = scrub_internal_chat_frames(source);
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let context = RecordContext {
                 stats,
@@ -255,7 +259,7 @@ pub async fn chat_completions(
                 // 转发主链路：不是模型测试（见 `RecordContext::is_test`）
                 is_test: false,
                 // 来源客户端：入口判好带进来（见 `RecordContext::client`）
-                client: client.clone(),
+                source: request_source.clone(),
             };
             // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
             // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
@@ -279,6 +283,8 @@ pub async fn chat_completions(
                 Some(context) => context.complete(body).await,
                 None => body,
             };
+            let body =
+                crate::server::core::protocol::strip_internal_chat_fields(&body).into_owned();
             // 响应正文在记账前抄一份（完整 JSON 文本；序列化失败或调试模式
             // 关着给 None，那一侧少存一份正文不影响明细）
             let raw_response = pipeline::capture_raw_json(&body);
@@ -296,7 +302,7 @@ pub async fn chat_completions(
                     // 转发主链路：不是模型测试
                     is_test: false,
                     // 来源客户端：入口判好带进来
-                    client: client.clone(),
+                    source: request_source.clone(),
                 },
                 None,
             );
@@ -330,7 +336,7 @@ pub async fn chat_completions(
                     // 转发主链路：不是模型测试
                     is_test: false,
                     // 来源客户端：入口判好带进来
-                    client: client.clone(),
+                    source: request_source.clone(),
                 },
                 Some(message),
             );
@@ -492,4 +498,52 @@ pub fn spawn_catalog_refresh(state: &ServerState) {
     crate::spawn_task(async move {
         crate::server::core::providers::adapter::refresh_implemented(&store).await;
     });
+}
+
+/// Chat 出口的 SSE 清洗：剥掉内部暂存字段（`_wb_` 前缀）后再下发。
+///
+/// 只在帧里真的出现 `_wb_` 时才重新序列化（绝大多数帧原样返回），因此
+/// 热路径上没有额外解析成本。为什么会出现在这里：上游是 Responses 协议时，
+/// 内部的 chat 帧承载 `_wb_reasoning_item_id` / `_wb_encrypted_content`，
+/// Responses 与 Anthropic 出口要读它们，Chat 客户端不该看到。
+fn scrub_internal_chat_frames(
+    source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
+) -> Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> {
+    use futures::StreamExt;
+    Box::new(source.flat_map(|item| {
+        let frames: Vec<Result<Bytes, std::io::Error>> = match item {
+            Ok(chunk) => scrub_internal_chat_chunk(&chunk).into_iter().map(Ok).collect(),
+            Err(error) => vec![Err(error)],
+        };
+        futures::stream::iter(frames)
+    }))
+}
+
+/// 一帧字节的清洗本体（一帧可能含多行 `data:`）。
+fn scrub_internal_chat_chunk(chunk: &Bytes) -> Vec<Bytes> {
+    let Ok(text) = std::str::from_utf8(chunk) else {
+        return vec![chunk.clone()];
+    };
+    if !text.contains("_wb_") {
+        return vec![chunk.clone()];
+    }
+    let mut out = String::with_capacity(chunk.len());
+    for line in text.split_inclusive('\n') {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            out.push_str(line);
+            continue;
+        };
+        let payload = payload.trim_end_matches('\n').trim_end_matches('\r');
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            let stripped = crate::server::core::protocol::strip_internal_chat_fields(&value);
+            if let Ok(clean) = serde_json::to_string(&stripped) {
+                out.push_str("data: ");
+                out.push_str(&clean);
+                out.push('\n');
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    vec![Bytes::from(out)]
 }

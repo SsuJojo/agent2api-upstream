@@ -69,6 +69,7 @@
 //! 保存，转发时报 400（见 `providers::custom::forward` 的分派骨架）。
 
 mod bindings;
+mod presets;
 /// 自定义提供商**定义**的导入合并（账号导出文件里的 `customProviders` 段）。
 ///
 /// `pub(crate)`：调用方是 `account_transfer::import_accounts` —— 账号导入的
@@ -126,8 +127,12 @@ const MAX_REASONING_CHARS: usize = 32;
 /// ── per-provider 特判字段（预置目录带来的上游修正）的长度上限 ──
 /// urlSuffix（查询串，如 "?beta=true"）：查询串一般十几个字符，128 已宽容
 const MAX_URL_SUFFIX_CHARS: usize = 128;
-/// 静态额外头的条数上限：特判用不到几条（Anthropic-Beta / Referer 类），8 足够
-const MAX_HEADER_ENTRIES: usize = 8;
+/// 静态额外头的条数上限。多数家只需要一两条（Anthropic-Beta / Referer 类），
+/// 但**客户端形态伪装**的家要整包复刻官方客户端的头族：Cline Pass 预置卡就是
+/// 9 条（与 `providers/cline/headers.rs` 的 DEFAULT_HEADERS 同一套，缺一条
+/// 上游按客户端形态校验就会 403）。取 16 —— 容得下「整包复刻 + 几条自定义」，
+/// 又仍然拦得住把 headers 当配置文件乱塞的手改数据。
+const MAX_HEADER_ENTRIES: usize = 16;
 /// 静态额外头的键 / 值长度上限：头名 RFC 形态几十字符、值（Anthropic-Beta 的
 /// beta 清单）可能上百字符，512 不拦正常值、只拦把文档粘进来的手改数据
 const MAX_HEADER_NAME_CHARS: usize = 64;
@@ -266,7 +271,7 @@ fn item_of(object: &Map<String, Value>) -> Value {
             .unwrap_or(""),
         client_emulation == CLIENT_EMULATION_OPENCODE,
     );
-    json!({
+    let mut item = json!({
         "id": id,
         "name": name,
         "protocol": protocol,
@@ -284,7 +289,9 @@ fn item_of(object: &Map<String, Value>) -> Value {
         // 余额查询方案：**读侧也会按 baseUrl 兜底识别**（存量记录没有这个键，
         // 见 BALANCE_SCHEMES 的说明），所以这里给的不是原始值而是归一结果
         "balanceScheme": balance_scheme_of_record(object),
-    })
+    });
+    presets::write_key(&mut item, presets::key_of_record(object));
+    item
 }
 
 /// 读侧归一：余额查询方案。优先用记录里的键（只认七个合法值），
@@ -652,8 +659,9 @@ pub fn create(payload: &Value) -> Result<Value, String> {
             .and_then(Value::as_str)
             .unwrap_or(""),
     )?;
+    let preset_key = presets::validate(object.get("presetKey"))?;
     let id = new_provider_id()?;
-    let item = json!({
+    let mut item = json!({
         "id": id,
         "name": name,
         "protocol": protocol,
@@ -670,6 +678,7 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         // 余额查询方案（预置卡片提交，见 BALANCE_SCHEMES 的说明）
         "balanceScheme": validate_balance_scheme(object.get("balanceScheme"))?,
     });
+    presets::write_key(&mut item, preset_key);
     let mut items = read_items();
     items.push(item.clone());
     if !write_items(&items) {
@@ -992,10 +1001,7 @@ pub async fn fetch_upstream_models(
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
     if !response_ok(status) {
-        // 摘要取前 200 字符：够定位（大多数错误体一两行），又不至于把
-        // 一整页 HTML 灌进错误提示
-        let summary: String = text.trim().chars().take(200).collect();
-        return Err(format!("上游返回 {status}: {summary}"));
+        return Err(format!("上游返回 {status}: {text}"));
     }
     let payload: Value = serde_json::from_str(&text)
         .map_err(|error| format!("上游响应不是合法 JSON: {error}"))?;

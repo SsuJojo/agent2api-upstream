@@ -199,9 +199,13 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty());
     if !reasoning.is_empty() || encrypted.is_some() {
+        // 与下面的 message / function_call 同一条取舍：这是重建的 input 项，
+        // 不是上游已持久化的 output 项，`id` 可省且必须省。尤其不能给带
+        // `encrypted_content` 的项配一个现造的 `rs_`：严格上游（官方
+        // store:false）按 item id 查已存项，伪造 id 会整轮被拒，比不带 id 更糟。
+        // 连续性只靠密文本身承载，不需要 id 参与。
         let mut item = json!({
             "type": "reasoning",
-            "id": random_id("rs"),
             "summary": if reasoning.is_empty() {
                 Vec::<Value>::new()
             } else {
@@ -918,5 +922,78 @@ mod tests {
         assert_eq!(items[1]["call_id"], "call_original");
         assert_eq!(items[2]["type"], "function_call_output");
         assert_eq!(items[2]["call_id"], "call_original");
+    }
+
+    /// 重建的 reasoning 项同样不能带 id —— 尤其是带加密密文的那条：现造的
+    /// `rs_` 配真实 `encrypted_content` 会让严格上游按 id 查不到已存项而整轮
+    /// 拒绝。连续性只靠密文本体，去掉 id 不影响下一轮接续。
+    #[test]
+    fn rebuilt_reasoning_item_omits_id_but_keeps_encrypted_content() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": "answer",
+                  "reasoning_content": "thought",
+                  "_wb_encrypted_content": "enc" },
+            ],
+        });
+
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{items:?}");
+        let reasoning = &items[0];
+        assert_eq!(reasoning["type"], "reasoning");
+        assert!(reasoning.get("id").is_none(), "重建的 reasoning 不该带 id: {reasoning}");
+        assert_eq!(reasoning["encrypted_content"], "enc");
+        assert_eq!(reasoning["summary"][0]["text"], "thought");
+        assert_eq!(items[1]["type"], "message");
+        assert!(items[1].get("id").is_none(), "{items:?}");
+    }
+
+    /// 没有原文 `id` 的 tool_calls：`call_id` 由兜底生成，仍然必须让
+    /// `function_call` 与 `function_call_output` 用同一个键 —— 配对只认
+    /// `call_id`，与 item `id` 无关（官方 schema 中 `FunctionCall.id` 为
+    /// optional，`call_id` 才是工具输出配对键）。
+    #[test]
+    fn generated_call_id_keeps_tool_output_pairing() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": null, "tool_calls": [
+                    { "type": "function", "function": { "name": "f", "arguments": "{}" } },
+                ] },
+            ],
+        });
+
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["type"], "function_call");
+        assert!(items[0].get("id").is_none(), "{items:?}");
+        assert!(
+            items[0]["call_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "缺少 call_id 时也要生成一个可配对的键: {items:?}"
+        );
+    }
+
+    /// 空正文的 assistant 轮次只发 function_call 项：不补一条空 message，
+    /// 否则上游可能把空 assistant 消息判成错误。
+    #[test]
+    fn tool_only_turn_emits_no_empty_assistant_message() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "call_1", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                ] },
+            ],
+        });
+
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_1");
     }
 }

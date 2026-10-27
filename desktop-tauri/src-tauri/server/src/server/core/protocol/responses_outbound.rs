@@ -241,12 +241,14 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
         items.push(item);
     }
     // 正文：Responses 不需要空的 assistant message（只带工具调用的轮次
-    // 只发 function_call 项）；空正文跳过也能避免上游把空消息判成错误
+    // 只发 function_call 项）；空正文跳过也能避免上游把空消息判成错误。
+    // 这是从 Chat 历史重建的 input 项，而非上游已持久化的 output 项；input
+    // item 的 id 可省。带 id 时部分 Responses 上游会按 persisted-item 引用查找，
+    // 对无状态重建出来的 id 查无此项会导致整轮请求被拒绝。
     let text = content_text(message.get("content").unwrap_or(&Value::Null));
     if !text.is_empty() {
         items.push(json!({
             "type": "message",
-            "id": random_id("msg"),
             "role": "assistant",
             "content": [{ "type": "output_text", "text": text }],
         }));
@@ -273,9 +275,10 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
                     raw
                 }
             };
+            // `call_id` 是与 function_call_output 配对的键；它不是 input item
+            // 的持久化 `id`。保留调用 ID，省略重建项的 id。
             items.push(json!({
                 "type": "function_call",
-                "id": random_id("fc"),
                 "call_id": call_id,
                 "name": name,
                 "arguments": arguments,
@@ -1276,6 +1279,72 @@ mod tests {
         assert_eq!(output[0]["type"], "input_text");
         assert_eq!(output[0]["text"], "Error: boom");
         assert_eq!(output[1]["type"], "input_image");
+    }
+
+    #[test]
+    fn rebuilt_assistant_input_items_omit_ids_and_preserve_tool_pairing() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": "answer" },
+                { "role": "assistant", "content": null, "tool_calls": [
+                    { "id": "call_original", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                ] },
+                { "role": "tool", "tool_call_id": "call_original", "content": "done" },
+            ],
+        });
+
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], "message");
+        assert!(items[0].get("id").is_none(), "{items:?}");
+        assert_eq!(items[1]["type"], "function_call");
+        assert!(items[1].get("id").is_none(), "{items:?}");
+        assert_eq!(items[1]["call_id"], "call_original");
+        assert_eq!(items[2]["type"], "function_call_output");
+        assert_eq!(items[2]["call_id"], "call_original");
+    }
+
+    #[test]
+    fn tool_only_turn_emits_no_empty_assistant_message() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "call_1", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                ] },
+            ],
+        });
+
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["type"], "function_call");
+        assert!(items[0].get("id").is_none(), "{items:?}");
+        assert_eq!(items[0]["call_id"], "call_1");
+    }
+
+    /// A raw call ID is the pairing key; the Responses item ID is optional and is
+    /// not substituted for `call_id`.
+    #[test]
+    fn rebuilt_function_call_without_id_still_has_call_id() {
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "assistant", "content": null, "tool_calls": [
+                    { "id": "call_1", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                ] },
+            ],
+        });
+        let body = responses_request_from_chat(&chat, "m").unwrap();
+        let item = &body["input"][0];
+        assert_eq!(item["type"], "function_call");
+        assert!(item.get("id").is_none(), "{item}");
+        assert_eq!(item["call_id"], "call_1");
     }
 
     /// 回放的 reasoning 项在**没有加密载体**时不得伪造 rs_ id —— 严格校验

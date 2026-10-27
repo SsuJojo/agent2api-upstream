@@ -55,7 +55,7 @@ pub(crate) const SNAPSHOT_FORMAT: &str = "agent2api-cloud-sync-snapshot";
 pub(crate) const SNAPSHOT_VERSION: u32 = 1;
 
 /// 进快照的表（顺序即插入顺序：账号先于其它，便于失败时一眼看出走到哪一步）
-pub(crate) const SYNCED_TABLES: &[&str] = &["accounts", "account_usage_records", "checkin_records"];
+pub(crate) const SYNCED_TABLES: &[&str] = &["accounts", "account_usage_records", "checkin_records", "account_limiter_events"];
 
 /// 非保留配置键里**不进快照**的项（理由见模块头三类排除）。
 const EXCLUDED_CONFIG_KEYS: &[&str] = &[
@@ -72,11 +72,20 @@ const EXCLUDED_CONFIG_KEYS: &[&str] = &[
 
 /// 保留键里**进快照**的项（其余保留键一律不进）。
 ///
-/// 这三项的语义是「用户配好的数据」而不是「这台机器的运行状态」：
+/// 这几项的语义是「用户配好的数据」而不是「这台机器的运行状态」：
 ///   · `agentProfiles`：「Agent」页的客户端配置（要写到本机配置文件里的那套）
 ///   · `proxyPool` / `proxySettings` / `subscriptions`：「网络代理」页的节点、
 ///     端口范围与订阅链接
-const SYNCED_RESERVED_KEYS: &[&str] = &["agentProfiles", "proxyPool", "proxySettings", "subscriptions"];
+///   · `sidebarLayout`：侧边栏的分组 / 顺序 / 显隐。它是用户一格一格调出来的
+///     界面排布，换台机器该带走（与主题 / 缩放不同 —— 那些是「这台设备的显示
+///     条件」，而菜单顺序是「这个人怎么用这个软件」）
+const SYNCED_RESERVED_KEYS: &[&str] = &[
+    "agentProfiles",
+    "proxyPool",
+    "proxySettings",
+    "subscriptions",
+    "sidebarLayout",
+];
 
 /// 这个 kv 键要不要进云同步。**唯一判定入口** —— 构建与比较都用它，
 /// 避免「构建时排除、变更检测时算进去」这种自相矛盾。

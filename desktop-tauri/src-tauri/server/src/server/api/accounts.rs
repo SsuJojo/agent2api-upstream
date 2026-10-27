@@ -4,10 +4,11 @@
 //!                                       provider 与顶层 providers 摘要）
 //!   POST   /api/accounts                手动添加账号（accessToken/refreshToken JSON）
 //!   GET    /api/accounts/export         导出全部账号（含 token，换机器后导入继续用）
+//!   POST   /api/accounts/export-files   导出单账号或本组的逐账号文件 { id? / provider? }
 //!   POST   /api/accounts/import         导入账号（merge：按 uid 匹配，命中更新、未命中追加）
 //!   POST   /api/accounts/current        把账号置顶（仅调整全局优先级）{ id }
-//!   POST   /api/accounts/batch          批量操作 { action, ids, proxy?, maxConcurrent? }
-//!                                       action: enable / disable / proxy / concurrency / remove
+//!   POST   /api/accounts/batch          批量操作（见 accounts_batch.rs）
+//!                                       enable / disable / proxy / concurrency / usageQuery / limiters / remove
 //!   POST   /api/accounts/reorder        整队重排（分组模式）{ queue: [id, …] }
 //!   POST   /api/accounts/refresh        刷新指定（或当前）账号的 token { id? }
 //!   POST   /api/accounts/refresh-expiring 刷新**全部**已过期/临期的账号凭证（批量）
@@ -53,6 +54,8 @@ use axum::extract::State;
 use axum::http::Method;
 use axum::response::Response;
 use serde_json::{json, Map, Value};
+
+pub use super::accounts_batch::batch_accounts;
 
 use crate::server::core::account_store::AccountStoreError;
 use crate::server::core::billing::checkin;
@@ -193,7 +196,7 @@ async fn add_plugin_account(
 ///
 /// Node 版不同分支的文案不一样（「上传内容不是有效 JSON」/「请求内容不是有效 JSON」），
 /// 所以文案由调用方传入，不统一成一句话。
-fn parse_json_body(body: &Bytes, fallback_message: &str) -> Result<Value, Response> {
+pub(super) fn parse_json_body(body: &Bytes, fallback_message: &str) -> Result<Value, Response> {
     match parse_body(body) {
         Ok(value) => Ok(value),
         Err(_) => Err(management_error(400, fallback_message)),
@@ -264,7 +267,7 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
 /// 重启的等待（重启要重建全部监听器，几秒）。引用增加要补监听器、引用减少
 /// 要回收端口（删账号 / 改走别的代理 / 改直连）—— 两个方向都交给对账的缺口
 /// 检测收敛，这里不猜方向，只拦「没变化」这一种白重启。
-fn reconcile_kernel_listeners(state: &ServerState, before: &std::collections::HashSet<String>) {
+pub(super) fn reconcile_kernel_listeners(state: &ServerState, before: &std::collections::HashSet<String>) {
     let after = state.store().referenced_pool_ids();
     if &after == before {
         return; // 引用集合没变（纯改配置），不重启
@@ -356,6 +359,7 @@ pub async fn dispatch(
     // ② 固定子路径（Node 版把它们放在 `<id>` 通配之前的原因）
     match (method.as_str(), rest) {
         ("GET", "export") => return export_accounts(&state),
+        ("POST", "export-files") => return super::accounts_export::account_files(&state, body).await,
         ("POST", "import") => return import_accounts(&state, body).await,
         ("POST", "current") => return set_current(&state, body).await,
         ("POST", "batch") => return batch_accounts(&state, body).await,
@@ -558,6 +562,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         .and_then(Value::as_str)
         .map(str::to_string);
     let import_name = name.as_deref();
+    if let Some(response) = super::accounts_export::import_account_file(state, provider, &payload, import_name) {
+        return response;
+    }
     // ── 「文件导入」三字段（均为可选；文件导入契约）─────────────
     // 用户在界面上**手选**桌面客户端的凭证文件时，前端把文件内容放进这些字段：
     //   - `authFileContent`：文件文本内容（JSON 类文件，前端已读过整个文件）；
@@ -897,89 +904,6 @@ pub async fn set_current(state: &ServerState, body: &Bytes) -> Response {
                 logging::log("[Accounts]", &format!("已在全局队列第一位，无需置顶: {id}"));
             }
             ok_json(result)
-        }
-        Err(error) => store_error(error),
-    }
-}
-
-// ─── POST /api/accounts/batch ───────────────────────────────
-
-pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
-    let payload = match parse_json_body(&body, "请求内容不是有效 JSON") {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    // 引用集合快照（批量改代理成功后对账，见 `reconcile_kernel_listeners`）
-    let refs_before = state.store().referenced_pool_ids();
-    // ids 去重 + 过滤空串，逐字照抄 Node 版
-    let mut ids: Vec<String> = Vec::new();
-    if let Some(items) = payload.get("ids").and_then(Value::as_array) {
-        for item in items {
-            if let Some(text) = item.as_str() {
-                if !text.is_empty() && !ids.iter().any(|existing| existing == text) {
-                    ids.push(text.to_string());
-                }
-            }
-        }
-    }
-    if ids.is_empty() {
-        return management_error(400, "缺少要操作的账号 id");
-    }
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    let result = match action.as_str() {
-        "remove" => state.store().batch_remove(&ids),
-        "enable" | "disable" => {
-            let enabled = action == "enable";
-            state.store().batch_update(&ids, &json!({ "enabled": enabled }))
-        }
-        "proxy" => {
-            // 允许 proxy=null（批量改为直连）；缺字段是显式报错
-            let Some(target) = payload.get("proxy") else {
-                return management_error(400, "批量修改代理时缺少 proxy 字段");
-            };
-            state.store().batch_update(&ids, &json!({ "proxy": target }))
-        }
-        "concurrency" => {
-            // 并发上限（0 = 不限）；缺字段是显式报错，值本身由 store 归一
-            // （非负整数、封顶 999，与单账号设置面板同一份校验）
-            let Some(target) = payload.get("maxConcurrent") else {
-                return management_error(400, "批量设置并发上限时缺少 maxConcurrent 字段");
-            };
-            state
-                .store()
-                .batch_update(&ids, &json!({ "maxConcurrent": target }))
-        }
-        other => {
-            return management_error(
-                400,
-                format!(
-                    "不支持的批量操作: {}",
-                    if other.is_empty() { "(空)" } else { other }
-                ),
-            )
-        }
-    };
-
-    match result {
-        Ok(value) => {
-            // 批量改代理 / 删除成功后对账：补监听器与回收端口都由对账的
-            // 缺口检测收敛（见 `reconcile_kernel_listeners`）
-            reconcile_kernel_listeners(state, &refs_before);
-            // 响应带上 action，与 Node 版 `{ action, ...result, list }` 一致
-            let mut merged = Map::new();
-            merged.insert("action".to_string(), Value::String(action));
-            if let Some(object) = value.as_object() {
-                for (key, item) in object {
-                    merged.insert(key.clone(), item.clone());
-                }
-            }
-            ok_json(Value::Object(merged))
         }
         Err(error) => store_error(error),
     }

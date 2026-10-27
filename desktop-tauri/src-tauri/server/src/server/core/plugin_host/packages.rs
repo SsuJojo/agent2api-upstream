@@ -1,7 +1,7 @@
 //! 包在停止旧宿主之前完成解包与验签；登记失败时恢复同版本重装的原目录。
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent2api_provider_protocol as proto;
@@ -24,6 +24,33 @@ impl Drop for PreparedPack {
             let _ = std::fs::remove_dir_all(&self.staging);
         }
     }
+}
+
+pub(super) fn ensure_entry_executable(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("读取插件入口失败（{}）：{error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("插件入口不是普通文件：{}", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o100 == 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o100))
+                .map_err(|error| format!("设置插件入口执行权限失败（{}）：{error}", path.display()))?;
+            let updated = std::fs::metadata(path)
+                .map_err(|error| format!("读取插件入口权限失败（{}）：{error}", path.display()))?;
+            if updated.permissions().mode() & 0o100 == 0 {
+                return Err(format!(
+                    "插件入口仍不可执行，请检查数据目录是否支持 Unix 执行权限：{}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn prepare(
@@ -85,6 +112,7 @@ pub fn prepare(
         if require_signed && signature != SignatureState::Verified {
             return Err("自动安装只接受通过官方签名校验的插件包，请手动安装未签名包".to_string());
         }
+        ensure_entry_executable(&staging.join(&entry))?;
         Ok(PreparedPack {
             staging: staging.clone(),
             manifest,
@@ -141,6 +169,7 @@ impl PreparedPack {
                     .as_ref()
                     .and_then(|pack| pack.providers.get(&id))
                     .copied()
+                    .or_else(|| super::ownership::migrated_enabled(&registry, &self.manifest.id, &id))
                     .unwrap_or(provider.default_enabled);
                 (id, enabled)
             })

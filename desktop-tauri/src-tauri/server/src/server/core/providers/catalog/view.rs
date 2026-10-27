@@ -9,92 +9,84 @@ use crate::server::core::capability;
 use crate::server::core::key_scope::{self, KeyScope};
 use crate::server::core::model_meta;
 use crate::server::core::model_rules;
-use crate::server::core::models::{list_response_from, model_id, suggest_from};
-use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
+use crate::server::core::models::{list_item, list_response_from, model_id, suggest_from};
 
-use super::routing::{entry_id_in_manifest, public_items_for_provider};
-use super::{active_manifests, aggregate_source, manifest_for, refresh_meta};
+use super::routing::{builtin_target, entry_id_in_manifest};
+use super::{active_manifests, aggregate_source, managed_manifests, manifest_for_provider, refresh_meta_for_provider};
+
+/// 一家会对外广告哪些名字：清单里原生的上游 id + **已启用**的映射别名。
+///
+/// ── `enabled` 这一道过滤不能少（曾经的漏洞）──────────────────
+/// 漏掉它时，被关掉的别名仍会进候选名，然后在 [`builtin_target`] 里绕开
+/// 「映射分支」的启停判定走另一条路：`entry_id_in_manifest` 按 id 找不到会
+/// **回落到比对上一条目的展示名（`name`）**，命中后按 `default_enabled` 判定
+/// —— 那与别名映射的开关无关。于是「关了映射、`/v1/models` 里却还在」。
+/// 实测：`space-bunny-alpha`（与展示名逐字相同）会中，`mimo-v2.6-flash`
+/// （展示名是 `Mimo V2.6 Flash`，比不中）不会中 —— 同一个开关两种结果。
+/// 模块头那句「所有对外出口使用相同的开启绑定集合」说的就是这里必须过滤。
+fn advertised_names(
+    rules: &model_rules::ModelRules,
+    provider: &str,
+    manifest: &[Value],
+) -> Vec<String> {
+    let mut names: Vec<String> = manifest.iter().map(model_id).collect();
+    names.extend(rules.mappings.iter()
+        .filter(|mapping| mapping.enabled)
+        .filter(|mapping| mapping.provider.as_deref().map_or(true, |owner| owner.eq_ignore_ascii_case(provider)))
+        .map(|mapping| mapping.alias.clone()));
+    names
+}
 
 /// 先在各提供商内判断绑定，再按对外名去重；不能先合并上游 ID 再拼别名，
 /// 否则某家关闭的映射会借另一家的同名上游重新出现在列表中。
-fn public_builtin_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(String, Value)> {
+fn public_builtin_items(active: &[(String, Vec<Value>)]) -> Vec<(String, Value)> {
     let rules = model_rules::current();
-    let mut claimed = HashSet::new();
-    let mut result = Vec::new();
-    for (kind, manifest) in active {
-        let provider = kind_id(*kind);
-        result.extend(public_items_for_provider(
-            &rules,
-            provider,
-            manifest,
-            &mut claimed,
-        ));
+    let mut claimed = std::collections::HashMap::<String, usize>::new();
+    let mut result: Vec<(String, Value)> = Vec::new();
+    for (provider, manifest) in active {
+        let names = advertised_names(&rules, provider, manifest);
+        for name in names {
+            let Some(wire) = builtin_target(&rules, provider, manifest, &name) else { continue };
+            let Some(upstream) = manifest.iter().find(|item| model_id(item) == wire.model) else { continue };
+            let mut item = list_item(upstream, provider);
+            if let Some(index) = claimed.get(&name.to_lowercase()).copied() {
+                let existing = &mut result[index].1;
+                if item.get("supports_image_editing").and_then(Value::as_bool) == Some(true)
+                    && existing.get("kind").and_then(Value::as_str) == Some("image")
+                {
+                    existing["supports_image_editing"] = Value::Bool(true);
+                    existing["supports_images"] = Value::Bool(true);
+                    existing["input_modalities"] = json!(["text", "image"]);
+                }
+                continue;
+            }
+            claimed.insert(name.to_lowercase(), result.len());
+            if let Some(object) = item.as_object_mut() {
+                object.insert("id".to_string(), Value::String(name.clone()));
+                if !name.eq_ignore_ascii_case(&wire.model) {
+                    object.insert("name".to_string(), Value::String(name));
+                    object.insert("is_default".to_string(), Value::Bool(false));
+                }
+            }
+            result.push((provider.to_string(), item));
+        }
     }
     result
 }
 
 pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value {
-    let active: Vec<_> = active_manifests(store)
-        .into_iter()
-        .filter(|(kind, _)| key_scope::allows_provider(scope, kind_id(*kind)))
+    let active: Vec<_> = active_manifests(store).into_iter()
+        .filter(|(provider, _)| key_scope::allows_provider(scope, provider))
         .collect();
     let (source, refreshed_at) = aggregate_source(&active);
-    let mut data: Vec<_> = public_builtin_items(&active)
-        .into_iter()
+    let mut data: Vec<_> = public_builtin_items(&active).into_iter()
         .map(|(_, item)| item)
         .filter(|item| key_scope::allows_model(scope, &model_id(item)))
         .collect();
     let builtin_count = data.len();
     super::super::custom::append_models_response(store, scope, &mut data);
-    // ── 插件家（运行时装进来的那些）────────────────────────────
-    // `active_manifests` 的键是 `ProviderKind`（编译期枚举），装不进运行期
-    // 才出现的 id。少了这一段，装了插件、模型也刷到了，`/v1/models` 里却
-    // 看不到它的任何模型 —— 客户端点名插件模型时还会被入口校验判成
-    // 「模型不存在」（见 `pipeline::resolve_model`）。追加在末尾，内置家的
-    // 条目顺序因此逐字不变。
-    append_plugin_models(store, scope, &mut data);
-    // 自定义家 / 插件家贡献了条目时，这份列表就不再是单/多家内置的来源了 ——
-    // 与「多家内置」同一个词（aggregate），下游据此知道列表是拼出来的。
-    let source = if data.len() > builtin_count {
-        "aggregate"
-    } else {
-        source
-    };
+    let source = if data.len() > builtin_count { "aggregate" } else { source };
     list_response_from(data, source, refreshed_at)
-}
-
-/// 把已装入插件的模型并进对外清单（返回追加的条数）。
-///
-/// ── 判据与内置家同源 ────────────────────────────────────────
-/// 内置家要「有可用账号」才广告（`provider_available`），插件家同样：
-/// 没有账号时广告出去只会让客户端选到一条转发必然 503 的模型。
-fn append_plugin_models(
-    store: &AccountStore,
-    scope: Option<&KeyScope>,
-    data: &mut Vec<Value>,
-) -> usize {
-    let mut claimed: HashSet<String> = data
-        .iter()
-        .map(|item| model_id(item).to_lowercase())
-        .collect();
-    let before = data.len();
-    let rules = model_rules::current();
-    for id in crate::server::core::plugin_host::installed_ids() {
-        if !key_scope::allows_provider(scope, &id) || store.accounts_for_provider(&id).is_empty() {
-            continue;
-        }
-        let Some(adapter) = crate::server::core::plugin_host::lookup(&id) else {
-            continue;
-        };
-        let manifest = adapter.list_models();
-        data.extend(
-            public_items_for_provider(&rules, &id, &manifest, &mut claimed)
-                .into_iter()
-                .map(|(_, item)| item)
-                .filter(|item| key_scope::allows_model(scope, &model_id(item))),
-        );
-    }
-    data.len() - before
 }
 
 /// 一家可用提供商都没有时（没加账号），入口校验要跳过「广告里有才放行」与
@@ -114,17 +106,12 @@ pub fn has_available_providers(store: &AccountStore) -> bool {
 }
 
 pub fn advertised_model_ids(store: &AccountStore) -> Vec<String> {
-    models_response(store, None)
-        .get("data")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().map(model_id).collect())
-        .unwrap_or_default()
+    models_response(store, None).get("data").and_then(Value::as_array)
+        .map(|items| items.iter().map(model_id).collect()).unwrap_or_default()
 }
 
 pub fn advertised_manifest_contains(store: &AccountStore, model: &str) -> bool {
-    advertised_model_ids(store)
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case(model))
+    advertised_model_ids(store).iter().any(|id| id.eq_ignore_ascii_case(model))
 }
 
 pub fn suggest_advertised(store: &AccountStore, model: &str, limit: usize) -> Vec<String> {
@@ -132,76 +119,36 @@ pub fn suggest_advertised(store: &AccountStore, model: &str, limit: usize) -> Ve
 }
 
 pub fn session_models(store: &AccountStore) -> Vec<Value> {
-    models_response(store, None)
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|mut item| {
-            let provider = item
-                .get("owned_by")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let is_default = item
-                .get("is_default")
-                .cloned()
-                .unwrap_or(Value::Bool(false));
+    models_response(store, None).get("data").and_then(Value::as_array)
+        .cloned().unwrap_or_default().into_iter().map(|mut item| {
+            let provider = item.get("owned_by").and_then(Value::as_str).unwrap_or("").to_string();
+            let is_default = item.get("is_default").cloned().unwrap_or(Value::Bool(false));
             if let Some(object) = item.as_object_mut() {
-                object.insert(
-                    "providerLabel".to_string(),
-                    Value::String(super::super::label_of(&provider)),
-                );
+                object.insert("providerLabel".to_string(), Value::String(super::super::label_of(&provider)));
                 object.insert("provider".to_string(), Value::String(provider));
                 object.insert("isDefault".to_string(), is_default);
             }
             item
-        })
-        .collect()
+        }).collect()
 }
 
 pub fn models_by_provider(store: &AccountStore) -> Value {
     let mut map = Map::new();
-    for (kind, manifest) in active_manifests(store) {
-        let mut names: Vec<_> = public_builtin_items(&[(kind, manifest)])
-            .into_iter()
-            .map(|(_, item)| model_id(&item))
-            .collect();
+    for (provider, manifest) in active_manifests(store) {
+        let mut names: Vec<_> = public_builtin_items(&[(provider.clone(), manifest)]).into_iter()
+            .map(|(_, item)| model_id(&item)).collect();
         names.sort_by_key(|name| name.to_lowercase());
-        map.insert(kind_id(kind).to_string(), json!(names));
+        map.insert(provider, json!(names));
     }
     for (provider, items) in super::super::custom::catalog_providers(store) {
         let mut names: Vec<_> = items.iter().map(model_id).collect();
         names.sort_by_key(|name| name.to_lowercase());
         map.insert(provider, json!(names));
     }
-    // 插件家（网关 Key 的「可用模型」多选按 provider 分组读这张表）
-    let rules = model_rules::current();
-    for id in crate::server::core::plugin_host::installed_ids() {
-        let Some(adapter) = crate::server::core::plugin_host::lookup(&id) else {
-            continue;
-        };
-        let mut claimed = HashSet::new();
-        let mut names: Vec<String> =
-            public_items_for_provider(&rules, &id, &adapter.list_models(), &mut claimed)
-                .into_iter()
-                .map(|(_, item)| model_id(&item))
-                .collect();
-        names.sort_by_key(|name| name.to_lowercase());
-        map.insert(id, json!(names));
-    }
     Value::Object(map)
 }
 
 /// 管理视图里的一行模型（`models` 数组的一项）+ 它对应的默认映射。
-///
-/// ── 为什么抽成函数 ──────────────────────────────────────────
-/// 内置家与插件家的清单来源完全不同（编译期枚举 vs 运行时注册表），但**行
-/// 形状必须一致** —— 前端按同一套键渲染。两处各写一份的后果是插件家的行
-/// 少几个键（能力位 / 可见性 / 刷新时刻），界面上表现为「这一家的列全是空」。
-///
-/// `provider` 是 `&str`（不是 `ProviderKind`）：插件家没有枚举值。
 #[allow(clippy::too_many_arguments)]
 fn push_managed_model(
     rules: &model_rules::ModelRules,
@@ -231,24 +178,13 @@ fn push_managed_model(
     let mut aliases = Vec::new();
     for (index, mapping) in rules.mappings.iter().enumerate() {
         if !mapping.target.eq_ignore_ascii_case(&id)
-            || !mapping
-                .provider
-                .as_deref()
-                .map_or(true, |owner| owner.eq_ignore_ascii_case(provider))
-        {
-            continue;
-        }
+            || !mapping.provider.as_deref().map_or(true, |owner| owner.eq_ignore_ascii_case(provider))
+        { continue; }
         attached.insert(index);
         if mapping.alias.eq_ignore_ascii_case(&id)
-            || aliases
-                .iter()
-                .any(|alias: &String| alias.eq_ignore_ascii_case(&mapping.alias))
-        {
-            continue;
-        }
-        let Some(effective) = rules.binding(provider, &mapping.alias, &id) else {
-            continue;
-        };
+            || aliases.iter().any(|alias: &String| alias.eq_ignore_ascii_case(&mapping.alias))
+        { continue; }
+        let Some(effective) = rules.binding(provider, &mapping.alias, &id) else { continue };
         aliases.push(mapping.alias.clone());
         mappings.push(json!({
             "alias": effective.alias, "target": id, "provider": provider,
@@ -256,15 +192,9 @@ fn push_managed_model(
             "isDefault": false, "dangling": false, "carried": true,
         }));
     }
-    let source = if rules
-        .custom
-        .iter()
-        .any(|custom| custom.matches(provider, &id))
-    {
+    let source = if rules.custom.iter().any(|custom| custom.matches(provider, &id)) {
         "manual"
-    } else {
-        source
-    };
+    } else { source };
     // 覆盖键列表从**本次快照**里查（不调 model_rules::current() —— 那会
     // 每行重新解析一遍配置，几百行的清单就是几百次解析）
     let cap_overrides: Vec<String> = rules
@@ -279,6 +209,11 @@ fn push_managed_model(
         "provider": provider, "providerLabel": super::super::label_of(provider),
         "source": source, "enabled": enabled, "aliases": aliases,
         "capabilities": capability::effective(&item),
+        "kind": if super::super::images::model_is_image(&item) { json!("image") }
+            else { item.get("kind").cloned().unwrap_or(json!("chat")) },
+        "output_modalities": item.get("output_modalities"),
+        "supports_image_generation": super::super::images::model_is_image(&item),
+        "supports_image_editing": super::super::images::provider_model_supports_editing(provider, &item),
         "capOverrides": cap_overrides,
         // 每个能力键的**来源**（`upstream` / `modelsdev` / `user`，见
         // `core::model_meta` 的模块头）。管理页据它把「上游实测」「社区
@@ -307,6 +242,7 @@ fn push_managed_model(
         // 缺失（`null`）= 这家没有可见性判据（当前是除上面四家之外的所有
         // provider）。界面据此显示 `—`，**不**把它当成「可见」或「不可见」：
         // 「这家没这个信息」和「这家说它不可见」是两件事。
+        "upstreamStatus": item.get("upstreamStatus"),
         "visibility": item.get("visibility").cloned().unwrap_or(Value::Null),
     }));
 }
@@ -321,11 +257,12 @@ fn push_managed_model(
 ///     「不知道」与「明确不支持」）；
 ///   · `capOverrides`：被用户覆盖的键（管理页据此给「已改」标记；
 ///     空数组 = 全部继承清单原值）。
-/// 清单原值已由 `manifest_for` 应用过覆盖，所以这里读到的就是生效值。
+/// 清单原值已由 `manifest_for_provider` 应用过覆盖，所以这里读到的就是生效值。
 pub fn manage_view(store: &AccountStore) -> Value {
     let rules = model_rules::current();
     let mut models = Vec::new();
     let mut mappings = Vec::new();
+    let mut providers = Vec::new();
     let mut attached = HashSet::new();
     // `(provider, id 小写)` 的出口去重（修复 #177 的兜底一层）。
     //
@@ -334,71 +271,30 @@ pub fn manage_view(store: &AccountStore) -> Value {
     // 是「清单的可视检查」，同 id 画出两行会连带下面那条默认映射也重复一条。
     // 这一层独立于源头：不管哪家目录出了脏数据，这里只认第一次出现的那条。
     let mut claimed: HashSet<(String, String)> = HashSet::new();
-    for (kind, mut manifest) in active_manifests(store) {
-        let provider = kind_id(kind);
-        manifest.sort_by_key(|item| !rules.default_enabled(provider, &model_id(item)));
-        // 一次取「远程与否 + 拉取时刻」：两者是同一处状态，分两次取会多读一次锁
-        let (remote, refreshed_at) = refresh_meta(kind);
+    for (provider, mut manifest) in managed_manifests(store) {
+        manifest.sort_by_key(|item| !rules.default_enabled(&provider, &model_id(item)));
+        let (remote, refreshed_at) = refresh_meta_for_provider(&provider);
         let source = if remote { "remote" } else { "builtin" };
+        let count = manifest.iter().map(model_id).filter(|id| !id.is_empty())
+            .map(|id| id.to_lowercase()).collect::<HashSet<_>>().len();
+        providers.push(json!({
+            "provider": provider,
+            "providerLabel": super::super::label_of(&provider),
+            "count": count,
+            "source": if count == 0 { "none" } else { source },
+            "refreshedAt": refreshed_at,
+        }));
         for item in manifest {
             push_managed_model(
-                &rules,
-                &mut models,
-                &mut mappings,
-                &mut attached,
-                &mut claimed,
-                provider,
-                source,
-                refreshed_at,
-                item,
-            );
-        }
-    }
-    // ── 插件家（运行时装进来的那些）────────────────────────────
-    // 与 `models_response` 同一理由：管理页是「清单的可视检查」，插件家的模型
-    // 若不出现在这里，用户就无法启停 / 改名 / 配映射 —— 而它们已经能转发了。
-    // 追加在末尾，内置家的行序（前端按 provider 匹配）逐字不变。
-    //
-    // ── 「有没有启用账号」这道过滤不能漏 ────────────────────────
-    // 内置家走 `active_manifests` → `provider_available`（`accounts_for_provider`
-    // 要求 `enabled && has_credentials`），所以「全部账号被禁用」的家在管理页
-    // 里是**不出现**的。插件家若不过同一道关，装了插件之后所有家都会列出来 ——
-    // 用户看到的是「模型管理里冒出十几家我根本没账号的提供商」，而内置家时代
-    // 它们本来会隐藏。这正是 `models_response` 的 `append_plugin_models` 已经
-    // 守着的同一条判据（见那里的注释：「没有账号时广告出去只会让客户端选到
-    // 一条转发必然 503 的模型」），两处必须同源，否则「对外清单」与「管理页
-    // 清单」对不上，用户没法解释为什么这里有一家、那里没有。
-    for id in crate::server::core::plugin_host::installed_ids() {
-        if store.accounts_for_provider(&id).is_empty() {
-            continue;
-        }
-        let Some(adapter) = crate::server::core::plugin_host::lookup(&id) else {
-            continue;
-        };
-        let mut manifest = adapter.list_models();
-        manifest.sort_by_key(|item| !rules.default_enabled(&id, &model_id(item)));
-        for item in manifest {
-            push_managed_model(
-                &rules,
-                &mut models,
-                &mut mappings,
-                &mut attached,
-                &mut claimed,
-                &id,
-                "remote",
-                0,
-                item,
+                &rules, &mut models, &mut mappings, &mut attached, &mut claimed,
+                &provider, source, refreshed_at, item,
             );
         }
     }
     for (index, mapping) in rules.mappings.iter().enumerate() {
-        if attached.contains(&index) {
-            continue;
-        }
+        if attached.contains(&index) { continue; }
         let carried = match mapping.provider.as_deref() {
-            Some(provider) => kind_from_id(provider).is_some_and(|kind| {
-                entry_id_in_manifest(&manifest_for(kind), &mapping.target).is_some()
-            }),
+            Some(provider) => entry_id_in_manifest(&manifest_for_provider(provider), &mapping.target).is_some(),
             None => !super::providers_for_model(&mapping.target).is_empty(),
         };
         mappings.push(json!({
@@ -411,6 +307,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
     json!({
         "models": models,
         "mappings": mappings,
+        "providers": providers,
         "reasoningLevels": model_rules::REASONING_LEVELS,
         // models.dev 元数据的当前状态（`builtin` / `cache` / `network` + 生成
         // 时刻 + 条数）。它服务的是「这份档位/能力是什么时候的数据」这个问题 ——
@@ -434,14 +331,6 @@ mod tests {
         vec![json!({ "id": "stealth/space-bunny-alpha", "name": "space-bunny-alpha" })]
     }
 
-    fn advertised_ids(rules: &model_rules::ModelRules) -> Vec<String> {
-        let mut claimed = HashSet::new();
-        public_items_for_provider(rules, "cline-free", &manifest(), &mut claimed)
-            .into_iter()
-            .map(|(_, item)| model_id(&item))
-            .collect()
-    }
-
     /// 被关掉的映射别名不能进广告候选名。漏了这道过滤时，别名会经由
     /// `builtin_target` 的「展示名回落」绕开启停判定 —— 于是「关了映射，
     /// `/v1/models` 里却还在」（2026-10-03 实测复现）。
@@ -451,7 +340,7 @@ mod tests {
             { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
               "provider": "cline-free", "enabled": false }
         ]));
-        let names = advertised_ids(&rules);
+        let names = advertised_names(&rules, "cline-free", &manifest());
         assert!(
             !names.iter().any(|name| name == "space-bunny-alpha"),
             "关掉的别名不该出现在候选名里: {names:?}"
@@ -467,7 +356,7 @@ mod tests {
             { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
               "provider": "cline-free", "enabled": true }
         ]));
-        let names = advertised_ids(&rules);
+        let names = advertised_names(&rules, "cline-free", &manifest());
         assert!(names.iter().any(|name| name == "space-bunny-alpha"));
     }
 
@@ -478,7 +367,7 @@ mod tests {
             { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
               "provider": "cline-free" }
         ]));
-        let names = advertised_ids(&rules);
+        let names = advertised_names(&rules, "cline-free", &manifest());
         assert!(names.iter().any(|name| name == "space-bunny-alpha"));
     }
 
@@ -489,23 +378,7 @@ mod tests {
             { "alias": "x-alias", "target": "stealth/space-bunny-alpha",
               "provider": "workbuddy", "enabled": true }
         ]));
-        let names = advertised_ids(&rules);
+        let names = advertised_names(&rules, "cline-free", &manifest());
         assert!(!names.iter().any(|name| name == "x-alias"));
-    }
-
-    #[test]
-    fn runtime_provider_alias_is_advertised_against_its_target() {
-        let rules = rules_with(json!([
-            { "alias": "luna1", "target": "Qwen3.8-Flash", "provider": "qoder" }
-        ]));
-        let manifest = vec![json!({ "id": "Qwen3.8-Flash", "name": "Qwen 3.8 Flash" })];
-        let mut claimed = HashSet::new();
-        let items = public_items_for_provider(&rules, "qoder", &manifest, &mut claimed);
-        let alias = items
-            .iter()
-            .find(|(_, item)| model_id(item) == "luna1")
-            .expect("mapped alias should be advertised");
-        assert_eq!(alias.1["owned_by"], "qoder");
-        assert_eq!(alias.1["name"], "luna1");
     }
 }

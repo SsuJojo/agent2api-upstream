@@ -687,10 +687,11 @@ impl AccountStore {
             "[Accounts]",
             &format!("✏️  账号已更新: {name}（{}）", changes.join("，")),
         );
-        if was_enabled && now_disabled {
-            // 账号锁先放开再动作注册表（两把锁不嵌套，见 `remove_account` 的说明）
+        let limiter_changed = patch.contains_key("limiterGroups") || patch.contains_key("limiters");
+        if was_enabled && now_disabled || limiter_changed {
             drop(_guard);
-            self.invalidate_catpaw_sessions(id, &provider);
+            if was_enabled && now_disabled { self.invalidate_catpaw_sessions(id, &provider); }
+            if limiter_changed { limiter::counter::refresh_account(&account); }
         }
         Ok((account, changes))
     }
@@ -765,6 +766,17 @@ impl AccountStore {
             if next != current {
                 record.set_enabled(next);
                 changes.push(if next { "已启用".to_string() } else { "已禁用".to_string() });
+            }
+        }
+
+        if let Some(value) = patch.get("allowRouteSkip") {
+            let Some(next) = value.as_bool() else {
+                return Err(AccountStoreError::bad_request("allowRouteSkip 必须是布尔值"));
+            };
+            let current = record.get("allowRouteSkip").and_then(Value::as_bool).unwrap_or(true);
+            if next != current {
+                record.set("allowRouteSkip", Value::Bool(next));
+                changes.push(if next { "允许失败后换号".to_string() } else { "失败后不换号".to_string() });
             }
         }
 
@@ -871,7 +883,20 @@ impl AccountStore {
             }
         }
 
-        if let Some(value) = patch.get("limiters") {
+        if let Some(value) = patch.get("limiterGroups") {
+            let groups = limiter::normalize_groups(value).map_err(AccountStoreError::bad_request)?;
+            let next = limiter::types::json_of(&groups);
+            let current = limiter::types::json_of(&limiter::effective_groups_in(record.fields()));
+            if next != current {
+                let legacy = limiter::legacy_rules(&groups);
+                record.set("limiterGroups", next);
+                record.set("limiters", limiter::rules_to_json(&legacy));
+                record.set("lowBalance", Self::legacy_low_balance_of(&legacy));
+                changes.push(limiter::describe_groups(&groups));
+            }
+        }
+
+        if let Some(value) = patch.get("limiters").filter(|_| !patch.contains_key("limiterGroups")) {
             // 每账号的「限制器」（余额 / Token 规则列表，源真值）：界面每次保存
             // 都整块发回，与 usageQuery 同一形态。写入侧归一化校验（校验即权威），
             // 比较基准 = 有效规则（记录上没有 limiters 键时由旧 lowBalance /
@@ -885,7 +910,8 @@ impl AccountStore {
                 .map_err(AccountStoreError::bad_request)?;
             let next = limiter::rules_to_json(&next_rules);
             let current = limiter::effective_rules_json_in(record.fields());
-            if next != current {
+            if next != current || record.fields().contains_key("limiterGroups") {
+                record.remove("limiterGroups");
                 record.set("limiters", next);
                 changes.push(limiter::describe_rules(&next_rules));
                 record.set("lowBalance", Self::legacy_low_balance_of(&next_rules));
@@ -918,7 +944,7 @@ impl AccountStore {
     /// 用户先关开关保存，不会因为残留的旧间隔被 400 挡住。非对象（null / 脏值）
     /// 一律视为「恢复缺省」= 开启、1 分钟（与读侧 `query_interval_of` 的缺省
     /// 同一口径）；显式关闭必须是 `{enabled:false}` 对象。
-    fn normalize_usage_query(value: &Value) -> Result<Value, AccountStoreError> {
+    pub(crate) fn normalize_usage_query(value: &Value) -> Result<Value, AccountStoreError> {
         const MIN: i64 = crate::server::core::usage_records::MIN_QUERY_INTERVAL_SECONDS;
         const MAX: i64 = crate::server::core::usage_records::MAX_QUERY_INTERVAL_SECONDS;
         const DEFAULT: i64 = crate::server::core::usage_records::DEFAULT_QUERY_INTERVAL_SECONDS;
@@ -998,7 +1024,7 @@ impl AccountStore {
     }
 
     /// 变更提示文案：`每 90 分钟` 这类人能读的间隔。
-    fn describe_usage_query(next: &Value) -> String {
+    pub(crate) fn describe_usage_query(next: &Value) -> String {
         let enabled = next.get("enabled").and_then(Value::as_bool).unwrap_or(false);
         if !enabled {
             return "自动查询余额 → 关闭".to_string();

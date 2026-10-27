@@ -38,19 +38,14 @@ use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
 use crate::server::ServerState;
 
-/// 令牌池挂在**国际版**（`zcode-intl`）那一家的插件实例上。
-///
-/// 池子是机器级的：令牌不绑账号、也不分地区（铸它的场景由上游配置给，
-/// 两地相同）。挑国际版是因为它是最常被用活动套餐的那一家 —— 与
-/// `api::qoder_umid` 同一取舍。
-const PROVIDER: &str = "zcode-intl";
-
-/// 调一次管理动作。
+/// 池子由已加载的任一 ZCode 实例访问，不要求该地区有启用账号。
 async fn call_action(state: &ServerState, action: &str, payload: &Value) -> Result<Value, (i32, String)> {
-    let Some(adapter) = crate::server::core::providers::adapter::adapter_by_id(PROVIDER) else {
+    let adapter = zcode::region::Region::ALL.into_iter()
+        .find_map(|region| crate::server::core::providers::adapter::adapter_by_id(region.provider_id()));
+    let Some(adapter) = adapter else {
         return Err((
             400,
-            "ZCode 的提供商插件没有安装，无法统计验证码令牌池".to_string(),
+            "ZCode 的提供商插件没有安装或未启用，无法访问验证码令牌池".to_string(),
         ));
     };
     adapter

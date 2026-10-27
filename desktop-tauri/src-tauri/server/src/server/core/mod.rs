@@ -69,6 +69,7 @@ pub mod api_keys;
 pub mod auth;
 pub mod auth_http;
 pub mod assistant_sessions;
+pub mod assistant_images;
 pub mod auto_checkin;
 pub mod beijing;
 pub mod billing;
@@ -111,8 +112,13 @@ pub mod proxy_rotate;
 pub mod proxy_settings;
 pub mod proxies;
 pub mod routing;
+pub mod routing_scope;
 pub mod sanitize;
 pub mod scheduled_tasks;
+// 侧边栏布局（分组 / 顺序 / 显隐）的持久化：整份 JSON 存 kv 一个键。
+// 布局的合法形状由前端 `ui/sidebar-layout.js` 拥有，后端只当不透明文档，
+// 见该模块头
+pub mod sidebar_layout;
 pub mod sub_kernel;
 pub mod subscriptions;
 // 运行环境探测（系统 / 架构 / 容器 / 服务形态 / 路径脱敏）：设置页「版本信息」

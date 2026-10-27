@@ -33,7 +33,7 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, RetryAdvice,
-    UpstreamErrorClass, UpstreamResponse,
+    RetryDecision, UpstreamErrorClass, UpstreamResponse,
 };
 use crate::server::core::providers::ProviderKind;
 use crate::server::core::upstream::usage::RequestTelemetry;
@@ -144,6 +144,9 @@ pub struct RpcAdapter {
     host: Arc<Host>,
     /// 握手时取回的能力位（本地缓存）。
     capabilities: proto::Capabilities,
+    image_generation: bool,
+    image_editing: bool,
+    image_models: Vec<Value>,
     /// `finish_reason` 拒答集合（握手时取回）。
     ///
     /// ── 为什么存的是 `&'static [&'static str]` 而不是 `Box<[...]>` ──
@@ -169,8 +172,25 @@ impl RpcAdapter {
             kind,
             host,
             capabilities: info.capabilities,
+            image_generation: false,
+            image_editing: false,
+            image_models: info.default_models.into_iter()
+                .filter(crate::server::core::providers::images::model_is_image).collect(),
             refusal_finishes: leak_slice(info.refusal_finishes),
             refusal_markers: leak_slice(info.refusal_markers),
+        }
+    }
+
+    pub(super) async fn load_image_capability(&mut self) {
+        let result = self.control(
+            crate::server::core::providers::images::CAPABILITIES_METHOD,
+            Value::Object(self.base()),
+        ).await;
+        let capabilities = result.unwrap_or(Value::Null);
+        self.image_generation = capabilities.get("generation").and_then(Value::as_bool).unwrap_or(false);
+        self.image_editing = capabilities.get("editing").and_then(Value::as_bool).unwrap_or(false);
+        if !self.image_generation {
+            self.image_models.clear();
         }
     }
 
@@ -196,6 +216,9 @@ impl RpcAdapter {
             .await
             .map_err(|e| GatewayError::with_status(503, format!("提供商插件不可用：{e}")))?;
         self.host.call_coded(method, params, timeout).await.map_err(|error| {
+            if let Some(failure) = super::errors::control_error(&error) {
+                return failure;
+            }
             // ── 「本地前置条件不成立」要还原成 556 而不是 502 ────────────
             // 编排层对这个码的处置与别的错误**完全不同**：它意味着请求还没
             // 出本机就注定发不出去（今天的用户：ZCode 活动套餐通道缺人机
@@ -260,10 +283,19 @@ impl ProviderAdapter for RpcAdapter {
         // 跨进程拿清单只能异步，因此这里**只返回本地缓存**，由后台任务
         // 定期调 `models.list` 填充。缓存为空时返回内置兜底（握手时
         // `provider.info` 已经带回来了）。
-        match super::rpc_cache::models_for(&self.id) {
-            Some(models) => models,
-            None => super::rpc_cache::default_models_for(&self.id).unwrap_or_default(),
+        let mut models = super::rpc_cache::models_for(self.id).unwrap_or_default();
+        for image in &self.image_models {
+            let id = crate::server::core::models::model_id(image);
+            if let Some(existing) = models.iter_mut().find(|item| crate::server::core::models::model_id(item).eq_ignore_ascii_case(&id)) {
+                existing["kind"] = serde_json::json!("image");
+                existing["output_modalities"] = image.get("output_modalities").cloned().unwrap_or(serde_json::json!(["image"]));
+                existing["supportsToolCall"] = Value::Bool(false);
+                existing["isDefault"] = Value::Bool(false);
+            } else if image.get("synthetic").and_then(Value::as_bool) == Some(true) {
+                models.push(image.clone());
+            }
         }
+        models
     }
 
     fn stream_refusal_finishes(&self) -> &'static [&'static str] {
@@ -308,16 +340,66 @@ impl ProviderAdapter for RpcAdapter {
                 .get("headers")
                 .and_then(|v| serde_json::from_value::<Vec<(String, String)>>(v.clone()).ok())
                 .unwrap_or_default();
-            let body = value.get("body").cloned().unwrap_or(Value::Null);
+            let mut body = value.get("body").cloned().unwrap_or(Value::Null);
             let upstream = value
                 .get("upstream")
                 .and_then(|v| serde_json::from_value::<proto::UpstreamKind>(v.clone()).ok())
                 .unwrap_or_default();
+            if upstream == proto::UpstreamKind::Gemini {
+                super::gemini_signatures::fill_cached(&mut body);
+            }
             Ok(ChatRequestPlan {
                 url,
                 headers,
                 body,
                 response: upstream_response(upstream),
+            })
+        })
+    }
+
+    fn supports_image_generation(&self) -> bool {
+        self.image_generation
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        self.image_editing
+    }
+
+    fn build_image_request_async<'a>(
+        &'a self,
+        account: &'a Value,
+        body: &'a Value,
+        client_headers: &'a HeaderMap,
+        operation: crate::server::core::providers::images::ImageOperation,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ChatRequestPlan, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            use crate::server::core::providers::images::ImageRequestPlan;
+            let params = serde_json::json!({
+                "provider": self.id,
+                "account": account_id_of(account),
+                "proxy": proxy_of(account),
+                "body": body,
+                "headers": headers_json(client_headers),
+                "wire_model": body.get("model").and_then(Value::as_str).unwrap_or(""),
+            });
+            // RPC 一帧上限 16 MiB；超限在写管道前拒绝，不让插件因读到半帧退出。
+            let size = serde_json::to_vec(&params).map_err(|_| GatewayError::bad_request("图片请求无法序列化"))?.len();
+            if size > 14 * 1024 * 1024 {
+                return Err(GatewayError::with_status(413, "图片请求内联数据总大小不得超过 14 MiB"));
+            }
+            let value = self.network(operation.method(), params).await?;
+            let plan: ImageRequestPlan = serde_json::from_value(value)
+                .map_err(|error| GatewayError::with_status(502, format!("插件生图计划无法解析：{error}")))?;
+            if plan.url.trim().is_empty() || !plan.body.is_object() {
+                return Err(GatewayError::with_status(502, "插件生图计划缺少上游地址或 JSON 请求体"));
+            }
+            Ok(ChatRequestPlan {
+                url: plan.url,
+                headers: plan.headers,
+                body: plan.body,
+                response: UpstreamResponse::Images(plan.response),
             })
         })
     }
@@ -597,25 +679,33 @@ impl ProviderAdapter for RpcAdapter {
             {
                 Ok(value) => match serde_json::from_value::<proto::RefreshOutcome>(value) {
                     Ok(outcome) => {
-                        // 刷新成功就把新清单写进本地缓存 —— 否则界面上的
-                        // 「模型」列要到下一次重启才更新（`list_models` 只读
-                        // 缓存，见它的说明）。空清单不覆盖已有值由缓存负责。
-                        if outcome.refreshed && outcome.count > 0 {
-                            if let Ok(list) = self
-                                .control(
-                                    proto::methods::gateway::MODELS_LIST,
-                                    self.with_account(account_id),
-                                )
-                                .await
-                            {
-                                if let Ok(list) = serde_json::from_value::<proto::ModelList>(list) {
-                                    super::rpc_cache::set_remote(&self.id, list.models);
-                                }
-                            }
+                        if !outcome.refreshed {
+                            return ModelRefreshOutcome {
+                                refreshed: false,
+                                count: outcome.count,
+                                message: outcome.message,
+                            };
                         }
+                        let list = match self.control(
+                            proto::methods::gateway::MODELS_LIST,
+                            self.with_account(account_id),
+                        ).await {
+                            Ok(value) => match serde_json::from_value::<proto::ModelList>(value) {
+                                Ok(list) => list,
+                                Err(error) => return ModelRefreshOutcome::failed(
+                                    format!("插件刷新后返回的模型清单无法解析: {error}"),
+                                ),
+                            },
+                            Err(error) => return ModelRefreshOutcome::failed(error.message),
+                        };
+                        let count = super::rpc_cache::set_remote(self.id, list);
+                        if count == 0 {
+                            return ModelRefreshOutcome::failed("插件刷新后没有可用模型，已保留旧清单");
+                        }
+                        crate::server::core::providers::adapter::seed_hidden_visibility_defaults();
                         ModelRefreshOutcome {
-                            refreshed: outcome.refreshed,
-                            count: outcome.count,
+                            refreshed: true,
+                            count,
                             message: outcome.message,
                         }
                     }
@@ -777,6 +867,40 @@ impl ProviderAdapter for RpcAdapter {
                     delay_ms: advice.delay_ms,
                     reason: advice.reason,
                 })
+        })
+    }
+
+    fn retry_decision_async<'a>(
+        &'a self,
+        status: u16,
+        error_body: &'a Value,
+        attempt: usize,
+        budget: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RetryDecision> + Send + 'a>> {
+        Box::pin(async move {
+            let mut params = self.base();
+            params.insert("status".into(), Value::from(status));
+            params.insert("body".into(), error_body.clone());
+            params.insert("attempt".into(), Value::from(attempt));
+            params.insert("budget".into(), Value::from(budget));
+            let method = crate::server::core::providers::retry::RETRY_DECISION_METHOD;
+            match self.control(method, Value::Object(params)).await {
+                Ok(value) => serde_json::from_value(value).unwrap_or_else(|_| RetryDecision::Stop {
+                    reason: "提供商插件返回的重试决定无法解析，停止本次请求".to_string(),
+                }),
+                Err(error) if error.status_code == 501 => {
+                    match self.retry_advice_async(error_body, attempt, budget).await {
+                        Some(advice) => RetryDecision::Retry {
+                            delay_ms: advice.delay_ms,
+                            reason: advice.reason,
+                        },
+                        None => RetryDecision::Default,
+                    }
+                }
+                Err(error) => RetryDecision::Stop {
+                    reason: format!("提供商插件无法给出重试决定，停止本次请求：{}", error.message),
+                },
+            }
         })
     }
 
@@ -943,32 +1067,51 @@ impl ProviderAdapter for RpcAdapter {
     /// `ineligible` / `inactive` / `captcha` / `failed`），比内置家那个
     /// 两字段形状**多一层语义**（「今天已签过」与「刚签到」必须分开：前者
     /// 不写 `checkinAt` 以外的状态，后者要播报积分）。网关侧把它们折成
-    /// `{success, msg}` 时把六档的差异放进 `msg`，同时保留 `outcome` 键 ——
-    /// 上层只读 `{success, msg}`（与内置家同一段 `claim_result`），需要细分
-    /// 的地方（签到记录台账）读 `outcome`。
+    /// `{success, msg}` 时仍保留 outcome，Done 用 alreadyCompleted 表达，
+    /// 完成判定与签到记录据此区分本次领取、已领取和无活动。
     fn checkin_claim<'a>(
         &'a self,
-        _store: &'a AccountStore,
+        store: &'a AccountStore,
         account_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
     > {
+        self.checkin_claim_with_options(store, account_id, false)
+    }
+
+    fn plugin_account_view<'a>(
+        &'a self,
+        secret: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
         Box::pin(async move {
-            let value = self
-                .network(
-                    proto::methods::gateway::CHECKIN_CLAIM,
-                    self.with_account(account_id),
-                )
-                .await?;
+            let mut params = self.base();
+            params.insert("secret".into(), secret.clone());
+            self.control(proto::methods::gateway::ACCOUNT_VIEW, Value::Object(params)).await
+        })
+    }
+
+    fn checkin_claim_with_options<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        account_id: &'a str,
+        manual: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut params = self.base();
+            params.insert("account".into(), Value::String(account_id.to_string()));
+            params.insert("manual".into(), Value::Bool(manual));
+            let value = self.network(proto::methods::gateway::CHECKIN_CLAIM, Value::Object(params)).await?;
+            let retry_at = value.get("retryAt").cloned();
             let report: proto::CheckinReport = serde_json::from_value(value).map_err(|e| {
                 GatewayError::with_status(502, format!("插件返回的签到结果无法解析：{e}"))
             })?;
             let (success, default_message) = match report.outcome {
                 proto::CheckinOutcome::Claimed => (true, "签到成功"),
-                // 「今天已经签过了」也算成功：它意味着今天不能再领，
-                // 与「刚领到」在调度上是同一件事（判据见
-                // `billing::checkin::checkin_completed_today`）。
-                proto::CheckinOutcome::Done => (true, "今天已经签过了"),
+                proto::CheckinOutcome::Done => (false, "今天已经签过了"),
                 proto::CheckinOutcome::Ineligible => (false, "该账号不参与签到"),
                 proto::CheckinOutcome::Inactive => (false, "当前没有可领的活动"),
                 proto::CheckinOutcome::Captcha => {
@@ -982,14 +1125,18 @@ impl ProviderAdapter for RpcAdapter {
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .unwrap_or(default_message);
-            Ok(serde_json::json!({
+            let mut claim = serde_json::json!({
                 "success": success,
+                "alreadyCompleted": report.outcome == proto::CheckinOutcome::Done,
                 "msg": message,
-                // 细分档位（签到记录台账读它；`claim_result` 不读）
                 "outcome": format!("{:?}", report.outcome).to_lowercase(),
                 "credit": report.credit,
                 "streak": report.streak,
-            }))
+            });
+            if let Some(retry_at) = retry_at {
+                claim["retryAt"] = retry_at;
+            }
+            Ok(claim)
         })
     }
 

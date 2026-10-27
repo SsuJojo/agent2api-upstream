@@ -1,4 +1,4 @@
-/* Agent2API · 侧边栏布局（分组 / 顺序 / 显隐）—— 纯前端偏好 */
+/* Agent2API · 侧边栏布局（分组 / 顺序 / 显隐）—— 库为权威，localStorage 作首帧缓存 */
 /* global wbI18n */
 
 /**
@@ -19,11 +19,25 @@
  *   · hidden 是「单独隐藏的菜单」，与 group.hidden（整组隐藏）是两件事：
  *     整组隐藏时组内菜单的显隐状态原样保留，重新显示该组时不会丢。
  *
- * ── 为什么存 localStorage 而不是后端配置 ──────────────────────
- * 与主题 / 缩放 / 语言 / 计量单位同族：只影响本机这台设备的界面排布，
- * 不碰转发、不碰账号，也不需要跨设备同步。放进后端 config 只会多出
- * 「读配置失败时侧边栏怎么画」这条分支，而它的兜底仍然是「用默认值」——
- * 与 localStorage 读不到时完全一样，却多一次网络往返和一份迁移逻辑。
+ * ── 存在哪里：库是权威，localStorage 是首帧缓存 ─────────────────
+ * 权威副本在库里（`kv` 表的 `sidebarLayout` 键，经 `GET/PUT /api/sidebar-layout`
+ * 读写）。为什么必须落库：本产品有两个界面入口 —— 桌面壳（`tauri://localhost`）
+ * 与网关托管的网页端（`http://127.0.0.1:<port>`），**两者 origin 不同、
+ * localStorage 天然隔离**。只存 localStorage 的话，在 WebUI 里隐藏的菜单
+ * 在客户端里照旧显示，用户看到的就是「设置没生效」。
+ *
+ * 但读盘仍然是**同步读 localStorage**，这是刻意的：
+ *   · 侧边栏首帧由 app.js 在模块顶部同步渲染（那条时序是契约，见那里的注释），
+ *     改成等一次网络往返会让侧边栏先空一下再出现；
+ *   · 桥不可用（浏览器直开、注入失败）时界面照常可用，不该整块空掉。
+ * 于是分工是：**同步读缓存画首帧，异步对库做同步**（`syncFromServer`）。
+ * 缓存与库不一致的窗口最多是一次网络往返 —— 拉到库里的值就重画。
+ *
+ * ── 写：先缓存，再推库 ──────────────────────────────────────
+ * `writeLayout` 同步写 localStorage（界面立刻生效、刷新不丢），然后
+ * fire-and-forget 把整份推给后端。推失败不阻塞界面（与「存不下只影响下次
+ * 启动」同一取向），但要 `console.warn` —— 否则「另一台设备看不到这次改动」
+ * 会是个无从下手的谜。
  *
  * ── 向前兼容（这一段决定了这个文件为什么不能省）────────────────
  * 读盘一律按 MENU_KEYS 校验：
@@ -31,9 +45,15 @@
  *   · 新版本新增、但存盘里没有的菜单，自动补进第一组末尾 ——
  *     否则升级后新功能会「凭空消失」，用户只会以为坏了；
  *   · 同一菜单出现在两组时只保留先出现的那一份（数据被手改过时兜底）。
+ *
+ * 这些校验同时是**从库读回数据时**的防线：库里的那份可能来自更老的版本，
+ * 也可能被外部工具改过，`normalizeLayout` 是它进入界面前的唯一关口。
  */
 (() => {
-  /** 持久化键：沿用项目既有的 workbuddy-desktop-* 前缀；-v1 留给将来的结构变更 */
+  /**
+   * 首帧缓存的键（**不是**权威副本 —— 权威在库里的 `kv.sidebarLayout`，见模块头）。
+   * 沿用项目既有的 workbuddy-desktop-* 前缀；-v1 留给将来的结构变更。
+   */
   const STORAGE_KEY = 'workbuddy-sidebar-layout-v1';
 
   /**
@@ -60,8 +80,9 @@
     // /旅行这类专属面板，都由插件申报）。没装插件时页面显示空态并指路，比一个
     // 凭空消失的菜单项清楚得多。
     { key: 'checkin', label: wbI18n.t('签到中心'), icon: 'checkin' },
+    { key: 'routing', label: wbI18n.t('路由'), icon: 'route' },
     { key: 'gateway', label: wbI18n.t('模型管理'), icon: 'gateway' },
-    { key: 'agent', label: wbI18n.t('Agent'), icon: 'agent' },
+    { key: 'agent', label: wbI18n.t('Agent 配置'), icon: 'agent' },
     { key: 'proxies', label: wbI18n.t('网络代理'), icon: 'proxies' },
     { key: 'keys', label: wbI18n.t('网关 Key'), icon: 'key' },
     { key: 'docs', label: wbI18n.t('文档'), icon: 'logs' },
@@ -207,7 +228,7 @@
         { id: 'g-overview', label: '概览', custom: false, hidden: false,
           items: ['assistant', 'overview', 'accounts', 'checkin'] },
         { id: 'g-forward', label: '转发链路', custom: false, hidden: false,
-          items: ['gateway', 'agent', 'proxies', 'keys', 'docs'] },
+          items: ['routing', 'gateway', 'agent', 'proxies', 'keys', 'docs'] },
         { id: 'g-diag', label: '诊断', custom: false, hidden: false,
           items: ['requests', 'logs', 'tasks'] },
         { id: 'g-system', label: '系统', custom: false, hidden: false,
@@ -296,7 +317,9 @@
       const defaults = defaultLayout().groups;
       for (const key of missing) {
         const home = defaults.find(group => group.items.includes(key));
-        const target = home ? groups.find(group => group.id === home.id) : null;
+        const target = key === 'routing'
+          ? groups.find(group => group.items.includes('gateway')) || (home ? groups.find(group => group.id === home.id) : null)
+          : home ? groups.find(group => group.id === home.id) : null;
         if (!target) {
           groups[0].items.push(key);
           continue;
@@ -345,7 +368,11 @@
   }
 
   /**
-   * 读本机布局；任何异常（无存储 / 坏 JSON）都退回默认布局。
+   * 读**缓存**里的布局；任何异常（无缓存 / 坏 JSON）都退回默认布局。
+   *
+   * ⚠ 名字是历史遗留：它读的是 localStorage 那份首帧缓存，不是库里的权威副本。
+   * 权威副本经 `syncFromServer` 异步拉回并覆盖缓存，之后这里读到的就是它。
+   * 之所以保持同步：首帧渲染在模块顶部同步跑（见 app.js 的契约注释）。
    *
    * ── 为什么「没存过」也要过 `normalizeLayout` ────────────────
    * 首次运行（localStorage 里还没有布局）时若直接返回 `defaultLayout()`，
@@ -369,13 +396,113 @@
     }
   }
 
-  /** 写本机布局；存储不可用（隐私模式 / 配额满）时静默失败，界面照常工作 */
+  /**
+   * 写布局：先写首帧缓存（同步、立刻生效），再把整份推给库（异步、尽力而为）。
+   *
+   * 顺序不能反：缓存写失败（隐私模式 / 配额满）时界面仍按内存里的新布局走，
+   * 而库那次推送成功就能在刷新后恢复 —— 两条路互为兜底。
+   *
+   * 推库失败只 `console.warn`，不弹 toast：界面本地已经生效，用户看到的是
+   * 「设置成功」；此时弹一句「保存失败」只会让人以为改坏了。真正需要知道的
+   * 是「另一台设备看不到这次改动」，而那是排查时的信息，写控制台即可。
+   */
   function writeLayout(layout) {
+    const normalized = normalizeLayout(layout);
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizeLayout(layout)));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
     } catch {
       /* 存不下只影响下次启动，不影响本次会话 */
     }
+    pushToServer(normalized);
+  }
+
+  /* ─── 与库同步（权威副本）───────────────── */
+
+  /**
+   * 最近一次本地写入的时刻（毫秒）。用于躲开「自己刚写的还没到库」那个窗口：
+   * 用户改完布局 → `writeLayout` 立刻写缓存并发出 PUT，而 20 秒轮询的 GET
+   * 可能赶在那条 PUT 落库之前回来，读到旧值就把用户刚改的布局又盖回去。
+   * 宽限期内的 GET 结果一律不采信（等下一轮，那时 PUT 早已落库）。
+   */
+  let lastLocalWriteAt = 0;
+  const LOCAL_WRITE_GRACE_MS = 3_000;
+
+  /**
+   * 把布局推给后端。桥不可用（浏览器直开 / 注入失败）时静默跳过 ——
+   * 那种形态下本来就只有 localStorage 这一份，行为与改造前一致。
+   *
+   * 不做并发合并：一次布局变更是用户的一次明确操作，连点两下就是两次写入，
+   * 后到的覆盖先到的正好是用户期望的顺序（后端是整份 UPSERT，天然幂等）。
+   */
+  function pushToServer(layout) {
+    lastLocalWriteAt = Date.now();
+    const bridge = window.workbuddyDesktop;
+    if (!bridge || typeof bridge.saveSidebarLayout !== 'function') return;
+    try {
+      Promise.resolve(bridge.saveSidebarLayout(layout)).catch(error => {
+        console.warn('侧边栏布局保存到数据库失败（本机已生效，其它设备看不到这次改动）:', error);
+      });
+    } catch (error) {
+      console.warn('侧边栏布局保存到数据库失败（本机已生效，其它设备看不到这次改动）:', error);
+    }
+  }
+
+  /**
+   * 从库里拉一次布局，与缓存对齐。启动时调一次、之后随全局轮询调用。
+   *
+   * 四种结果：
+   *   · 刚在本地写过（宽限期内）→ 跳过这一轮。那条 PUT 可能还没落库，
+   *     此刻读到的旧值会把用户刚做的改动盖回去（见 `lastLocalWriteAt`）；
+   *   · 库里有布局 → 规整后覆盖缓存；**与缓存不同**才派 `wb:sidebar-layout`
+   *     重画（每轮轮询都重画会让用户正在拖动的项闪烁，与 `adoptPluginPages`
+   *     同一取舍）；
+   *   · 库里没有（`layout: null`）→ 这是首次落库的迁移窗口：把缓存里那份
+   *     （老用户本机已调好的布局）**上行**写一次，用户无感升级；
+   *   · 拉取失败 → 静默。离线 / 桥不可用时界面照常，下一轮再试。
+   *
+   * 返回 `true` 表示缓存被更新过（调用方目前不需要，留给将来的调用点）。
+   */
+  async function syncFromServer() {
+    // 宽限期：本地刚写完的这几秒内不采信库里的值（理由见上）
+    if (Date.now() - lastLocalWriteAt < LOCAL_WRITE_GRACE_MS) return false;
+    const bridge = window.workbuddyDesktop;
+    if (!bridge || typeof bridge.getSidebarLayout !== 'function') return false;
+    let remote;
+    try {
+      remote = await bridge.getSidebarLayout();
+    } catch {
+      return false; // 桥打不通：继续用缓存
+    }
+    // 等这一次网络往返期间用户又改了：以用户那次为准，本轮结果作废
+    if (Date.now() - lastLocalWriteAt < LOCAL_WRITE_GRACE_MS) return false;
+    const raw = remote && typeof remote === 'object' ? remote.layout : undefined;
+
+    // 库里没存过：把本机缓存上行（老用户迁移），之后以库为准
+    if (!raw || typeof raw !== 'object') {
+      pushToServer(readLayout());
+      return false;
+    }
+
+    const incoming = normalizeLayout(raw);
+    const incomingText = JSON.stringify(incoming);
+    let cachedText = null;
+    try {
+      cachedText = localStorage.getItem(STORAGE_KEY);
+    } catch {
+      cachedText = null;
+    }
+    // 比较的是「规整后的文本」而不是原始文本：库里那份可能来自旧版本
+    // （缺新菜单），规整会补位 —— 那种情况下缓存也该跟着更新，否则
+    // 每次启动都要重算一遍补位。
+    if (cachedText === incomingText) return false;
+
+    try {
+      localStorage.setItem(STORAGE_KEY, incomingText);
+    } catch {
+      /* 写不进缓存也仍然派事件：本次会话按库里的那份渲染 */
+    }
+    window.dispatchEvent(new CustomEvent('wb:sidebar-layout'));
+    return true;
   }
 
   /* ─── 查询 ─────────────────────────────── */
@@ -544,6 +671,9 @@
     writeLayout,
     cloneLayout,
     menuOf,
+    // 与库同步：`writeLayout` 内部会推库；`syncFromServer` 由 app.js 在启动
+    // 与全局轮询里调（见那里的调用点）。桥不可用时两者都是无害的空操作。
+    syncFromServer,
     // 插件页（运行时注册，见 `setDynamicMenus`）
     setDynamicMenus,
     dynamicMenuOf,

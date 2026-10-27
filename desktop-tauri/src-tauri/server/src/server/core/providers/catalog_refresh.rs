@@ -177,7 +177,7 @@ pub async fn refresh(
         let mut item = json!({
             "provider": id,
             "providerLabel": label,
-            "refreshedAt": 0,
+            "refreshedAt": catalog::refresh_meta_for_provider(&id).1,
         });
         if adapter.refresh_uses_account() {
             let used = if requested.is_empty() {
@@ -199,13 +199,14 @@ pub async fn refresh(
         let account = accounts.get(&id).and_then(Value::as_str).unwrap_or("");
         let outcome = adapter.refresh_models(store, account, manual).await;
         item["status"] = json!(if outcome.refreshed {
-            "ok"
+            "refreshed"
         } else if outcome.message.is_some() {
             "failed"
         } else {
             "skipped"
         });
         item["count"] = json!(outcome.count);
+        item["refreshedAt"] = json!(catalog::refresh_meta_for_provider(&id).1);
         if let Some(message) = outcome.message {
             item["message"] = json!(message);
         }

@@ -641,10 +641,12 @@ fn push_input_item(
                 return Ok(());
             };
             let content = content_to_chat(content, &role);
-            // 空消息要丢掉：上游对「空消息」的处理各家不一
-            //   - assistant：Responses 的 reasoning-only 项会退化成空消息；
-            //   - user：Codex 多 agent 的 `agent_message` 只有加密载荷，过滤后什么都不剩。
-            if content_text(&content).is_empty() && !content_is_structured(&content) {
+            // 空 assistant / user 消息要丢掉：上游对空消息的处理各家不一。
+            // `tool` 即使 content 为空也必须保留，否则会破坏 tool_call/result 配对。
+            if matches!(role.as_str(), "assistant" | "user")
+                && content_text(&content).is_empty()
+                && !content_is_structured(&content)
+            {
                 return Ok(());
             }
             let mut message = Map::new();
@@ -2297,5 +2299,22 @@ mod agent_message_tests {
         assert_eq!(content.len(), 2, "{content:?}");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn empty_tool_result_is_preserved() {
+        let body = json!({
+            "model":"m",
+            "input":[
+                {"type":"function_call", "call_id":"call-1", "name":"lookup", "arguments":"{}"},
+                {"role":"tool", "tool_call_id":"call-1", "content":""}
+            ]
+        });
+        let chat = chat_from_responses(&body).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call-1");
     }
 }

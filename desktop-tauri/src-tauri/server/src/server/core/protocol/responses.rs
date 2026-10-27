@@ -2355,6 +2355,8 @@ mod continuity_tests {
 
         assert!(response["output"].as_array().unwrap().iter().all(|item| {
             item["type"] != "reasoning" || item.get("encrypted_content").is_none()
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -2423,7 +2425,7 @@ mod agent_message_tests {
             "model":"m",
             "input":[
                 {"type":"function_call", "call_id":"call-1", "name":"lookup", "arguments":"{}"},
-                {"role":"tool", "tool_call_id":"call-1", "content":""}
+                {"type":"function_call_output", "call_id":"call-1", "output":""}
             ]
         });
         let chat = chat_from_responses(&body).unwrap();

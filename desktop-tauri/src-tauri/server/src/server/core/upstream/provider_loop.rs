@@ -287,6 +287,24 @@ const PAYLOAD_SIZE_REJECTION_STATUSES: &[u16] = &[413];
 /// 一个是「字节」，一个是「名字」，出处与措辞不同，将来各自的排除面也可能变。
 const DETERMINISTIC_NOT_FOUND_STATUSES: &[u16] = &[404];
 
+/// 明确的请求结构错误：重发相同 body 不会改变结果。
+///
+/// 上游有时仍用 HTTP 400 返回这类错误（而不是单独的 schema 状态码）。
+/// 只匹配稳定的错误文案，不能把所有 400 一律视为确定性失败：同一个 400
+/// 也可能表示临时上游状态或业务校验。
+fn is_deterministic_request_error(class: &UpstreamErrorClass, status: u16) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let UpstreamErrorClass::Fatal { message, .. } = class else {
+        return false;
+    };
+    let lowered = message.to_lowercase();
+    lowered.contains("raccoon")
+        && (lowered.contains("invalid user message")
+            || lowered.contains("valid raccoon chat completion messages"))
+}
+
 /// 轮询出网档（`core::proxy_rotate`）在 429 时**原地换出口**的次数上限。
 ///
 /// 为什么是 3：OpenCode Zen 免费档的 429 按 IP 判（这个出口的额度用完），换出口
@@ -385,7 +403,8 @@ fn fallback_retry_advice(
         // 编排层的事，这里只撤「原地再发一次」这一件事）
         UpstreamErrorClass::Fatal { .. }
             if PAYLOAD_SIZE_REJECTION_STATUSES.contains(&status)
-                || DETERMINISTIC_NOT_FOUND_STATUSES.contains(&status) =>
+                || DETERMINISTIC_NOT_FOUND_STATUSES.contains(&status)
+                || is_deterministic_request_error(class, status) =>
         {
             None
         }

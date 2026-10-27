@@ -299,9 +299,8 @@ fn a_payload_size_rejection_gets_no_in_place_retry() {
     );
 }
 
-/// 反对照：其它 4xx/未知失败照旧走兜底原地重发（这条改动只放开"体积拒收"那一格，
-/// 没有把 400 这类"含义由上游决定"的码一并排除）。404 已于 issue #255 单独豁免
-/// （路由 / 模型名类确定性失败，见 `DETERMINISTIC_NOT_FOUND_STATUSES`），不在此列。
+/// 反对照：普通 400/409 仍照旧走兜底原地重发；只有已识别的确定性
+/// raccoon 请求结构错误跳过原地重发。404 已于 issue #255 单独豁免。
 #[test]
 fn other_fatal_statuses_still_get_the_fallback_resend() {
     for status in [400u16, 409] {
@@ -310,6 +309,15 @@ fn other_fatal_statuses_still_get_the_fallback_resend() {
             "HTTP {status} 的语义由上游决定，兜底原地重发的既有行为不该变"
         );
     }
+    let raccoon_invalid_user = UpstreamErrorClass::Fatal {
+        status: 400,
+        upstream_code: None,
+        message: "上游返回 400: litellm.APIConnectionError: Custom_raccoonException - Invalid user message at index 32. Please ensure all user messages are valid raccoon chat completion messages.".to_string(),
+    };
+    assert!(
+        fallback_retry_advice(&raccoon_invalid_user, 3, 400).is_none(),
+        "raccoon 的确定性消息结构错误不应重复发送"
+    );
     assert!(
         !TRANSIENT_RETRY_STATUSES.contains(&413),
         "413 不该被当成瞬时抖动（否则瞬时那一档会把它重发回去）"
@@ -376,6 +384,32 @@ fn a_deterministic_404_skips_the_in_place_resend() {
     assert!(
         fallback_retry_advice(&bad_request, 3, 400).is_some(),
         "404 的豁免不许顺手把 400 也豁免了"
+    );
+}
+
+#[test]
+fn raccoon_invalid_user_message_skips_in_place_resend() {
+    let failure = UpstreamErrorClass::Fatal {
+        status: 400,
+        upstream_code: None,
+        message: "上游返回 400: litellm.APIConnectionError: Custom_raccoonException - Invalid user message at index 32. Please ensure all user messages are valid raccoon chat completion messages.".to_string(),
+    };
+    assert!(
+        fallback_retry_advice(&failure, 3, 400).is_none(),
+        "raccoon 的确定性消息结构错误不应重复发送相同 body"
+    );
+}
+
+#[test]
+fn non_raccoon_invalid_user_message_keeps_fallback_resend() {
+    let failure = UpstreamErrorClass::Fatal {
+        status: 400,
+        upstream_code: None,
+        message: "上游返回 400: Invalid user message".to_string(),
+    };
+    assert!(
+        fallback_retry_advice(&failure, 3, 400).is_some(),
+        "不能把其他上游的同名错误误判为 raccoon 错误"
     );
 }
 
